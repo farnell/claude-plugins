@@ -1,5 +1,6 @@
 {
   "name": "farnell-plugins",
+  "description": "Matt Farnell's personal Claude Code tools. Currently: adversarial-review (Claude × Codex code review).",
   "owner": {
     "name": "Matt Farnell",
     "email": "mfarnell@gmail.com"

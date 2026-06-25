@@ -1,3 +1,8 @@
+---
+description: Adversarial Claude × Codex review of a markdown file or GitHub PR (resumable, citation-checked).
+argument-hint: "<PR#|file.md> [--comment] [continue]"
+---
+
 Invoke the adversarial-review workflow using the Workflow tool.
 
 Parse $ARGUMENTS to extract the target (and optional flags):
@@ -9,7 +14,9 @@ Parse $ARGUMENTS to extract the target (and optional flags):
 - Optional `--comment` flag (or the user saying "post it to the PR" / "comment on the PR") → pass `comment: true`. **PR targets only** — it posts the synthesized result as ONE summary comment (confirmed findings + the disputed set + prioritized actions), created once and then **updated in place** on re-run via a hidden marker (no duplicate comments). Ignored with a note for file targets. Opt-in, off by default — this is the only write the workflow makes to GitHub.
 
 Then call (omit `effort` to take the size-aware default; add `comment: true` only when the user opted in):
-Workflow({ scriptPath: '.claude/workflows/adversarial-review.js', args: { target: '<parsed-target>', maxRounds: 3 } })
+Workflow({ name: 'adversarial-review', args: { target: '<parsed-target>', maxRounds: 3 } })
+
+Invoke by **`name`**, not a relative `scriptPath` — `name` resolves the engine cwd-independently from `~/.claude/workflows/adversarial-review.js` (the file the README's install step drops in) or a project `.claude/workflows/`. A relative `scriptPath` would resolve against the user's current project and fail in any repo that doesn't have its own copy. If `name` can't be found, the engine wasn't installed: re-run the README's `curl … -o ~/.claude/workflows/adversarial-review.js` step.
 
 After the workflow completes, format and present the result based on `status`:
 - `agreed` — both agents converged. Show summary, agreedFindings (severity + confidence + citation + action item), and prioritizedActionItems.
