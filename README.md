@@ -32,6 +32,39 @@ Assumes you already run both, authenticated:
 
 The Bash permissions the workflow needs (`codex exec`, `gh`, `mktemp`, …) ship in the plugin's `settings.json` and are applied automatically when the plugin is enabled.
 
+<details>
+<summary><strong>Setting up Codex</strong> (optional — skip if <code>codex</code> already works)</summary>
+
+The review's second opinion comes from OpenAI's Codex CLI. If you don't have it yet:
+
+```bash
+# install (pick one)
+npm install -g @openai/codex
+brew install --cask codex
+
+# authenticate: run codex and choose "Sign in with ChatGPT"
+# (Plus/Pro/Business/Edu/Enterprise) — or use an OpenAI API key.
+codex
+
+# sanity check
+codex exec "say hello"
+```
+
+**Optional: give Codex the same project context as Claude Code.** Codex reads `AGENTS.md` files (walking from the git root down to your working directory, plus a global `~/.codex/AGENTS.md`). If you already maintain a `CLAUDE.md`, symlink it so both tools share one source of truth — Codex then reviews with full knowledge of your architecture and conventions:
+
+```bash
+# from the repo root — AGENTS.md becomes a link to CLAUDE.md (CLAUDE.md stays canonical)
+ln -s CLAUDE.md AGENTS.md
+git add AGENTS.md   # commit it so clones get the link too
+```
+
+Notes:
+- Use the **uppercase** name `AGENTS.md` — git is case-sensitive even where macOS isn't, and Codex looks for that exact name.
+- Symlink the file at the **repo root**; nested `AGENTS.md` (e.g. `src/api/AGENTS.md → CLAUDE.md`) layer on top for that subtree, with deeper files weighted more heavily.
+- Verify Codex is loading it: from the repo root run `codex --ask-for-approval never "Summarize the current instructions."` and confirm it echoes your `CLAUDE.md` guidance.
+
+</details>
+
 ### Install
 
 ```bash
