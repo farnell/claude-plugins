@@ -27,7 +27,7 @@ Assumes you already run both, authenticated:
 /plugin marketplace add farnell/claude-plugins
 
 # 2. install the command + permissions
-/plugin install adversarial-review@claude-plugins
+/plugin install adversarial-review@farnell-plugins
 
 # 3. drop in the workflow engine
 #    (the one manual step — Claude Code plugins can't bundle workflows, so the
