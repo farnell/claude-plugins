@@ -1,16 +1,6 @@
 # claude-plugins
 
-A personal marketplace of [Claude Code](https://docs.claude.com/en/docs/claude-code) tools. Add the marketplace once, then install any tool below with `/plugin`.
-
-```
-/plugin marketplace add farnell/claude-plugins
-```
-
-| Tool | What it is | Install |
-|------|-----------|---------|
-| [`adversarial-review`](#adversarial-review) | Claude × Codex adversarial code review (file or PR) | `/plugin install adversarial-review@claude-plugins` |
-
-> **Note on workflows.** Most tools here install cleanly via `/plugin`. `adversarial-review` is built on a Claude Code **workflow**, which the plugin system can't auto-load — so it has one extra one-line step (copy the workflow file into `~/.claude/workflows/`). It's called out in its install steps below.
+A small marketplace of [Claude Code](https://docs.claude.com/en/docs/claude-code) tools. Currently one: **adversarial-review** — a Claude × Codex code reviewer.
 
 ---
 
@@ -27,10 +17,37 @@ Two models review the same target and argue until they agree. **Codex (`gpt-5.5`
 Assumes you already run both, authenticated:
 
 - **Claude Code** — the host (this is a Claude Code tool).
-- **[Codex CLI](https://github.com/openai/codex)** — the second reviewer (`codex exec` must work).
+- **[Codex CLI](https://github.com/openai/codex)** — the second reviewer (`codex exec` must work). Setup walkthrough below if you need it.
 - **[`gh` CLI](https://cli.github.com/)** — only for PR targets and `--comment` (needs repo scope).
 
-The Bash permissions the workflow needs (`codex exec`, `gh`, `mktemp`, …) ship in the plugin's `settings.json` and are applied automatically when the plugin is enabled.
+### Install
+
+```bash
+# 1. add this marketplace (once)
+/plugin marketplace add farnell/claude-plugins
+
+# 2. install the command + permissions
+/plugin install adversarial-review@claude-plugins
+
+# 3. drop in the workflow engine
+#    (the one manual step — Claude Code plugins can't bundle workflows, so the
+#     engine is copied into ~/.claude/workflows/ rather than installed by /plugin)
+curl -o ~/.claude/workflows/adversarial-review.js \
+  https://raw.githubusercontent.com/farnell/claude-plugins/main/adversarial-review/workflows/adversarial-review.js
+```
+
+The Bash permissions the workflow needs (`codex exec`, `gh`, `mktemp`, …) ship in the plugin's `settings.json` and apply automatically once it's enabled.
+
+### Usage
+
+```
+/adversarial-review 260                     # review PR #260
+/adversarial-review docs/architecture.md    # review a file
+/adversarial-review 260 --comment           # review a PR and post the synthesis as a comment
+/adversarial-review continue                # approve more rounds from the last checkpoint
+```
+
+Tuning (optional): pass `effort` (`low`|`medium`|`high`|`xhigh`|`max`) and/or `model` to change the Codex reasoning tier. Defaults are **`high` for PRs, `medium` for files**.
 
 <details>
 <summary><strong>Setting up Codex</strong> (optional — skip if <code>codex</code> already works)</summary>
@@ -64,31 +81,6 @@ Notes:
 - Verify Codex is loading it: from the repo root run `codex --ask-for-approval never "Summarize the current instructions."` and confirm it echoes your `CLAUDE.md` guidance.
 
 </details>
-
-### Install
-
-```bash
-# 1. add the marketplace (once)
-/plugin marketplace add farnell/claude-plugins
-
-# 2. install the command + permissions
-/plugin install adversarial-review@claude-plugins
-
-# 3. drop in the workflow engine (the one manual step — workflows can't ship in a plugin)
-curl -o ~/.claude/workflows/adversarial-review.js \
-  https://raw.githubusercontent.com/farnell/claude-plugins/main/adversarial-review/workflows/adversarial-review.js
-```
-
-### Usage
-
-```
-/adversarial-review 260                     # review PR #260
-/adversarial-review docs/architecture.md    # review a file
-/adversarial-review 260 --comment           # review a PR and post the synthesis as a comment
-/adversarial-review continue                # approve more rounds from the last checkpoint
-```
-
-Tuning (optional): pass `effort` (`low`|`medium`|`high`|`xhigh`|`max`) and/or `model` to change the Codex reasoning tier. Defaults are **`high` for PRs, `medium` for files**.
 
 ### Hardening / known work
 
