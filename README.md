@@ -25,16 +25,23 @@ Assumes you already run both, authenticated:
 ```bash
 /plugin marketplace add farnell/claude-plugins
 /plugin install adversarial-review@farnell-plugins
-# then restart Claude Code
 ```
 
-That's it. Claude Code plugins can't register workflows directly, so the engine ships *inside* the plugin and a bundled `SessionStart` hook copies it into `~/.claude/workflows/` on every session start — installing, and keeping it current on every update, with no manual step. The Bash permissions the workflow needs (`codex exec`, `gh`, `mktemp`, …) ship in the plugin's `settings.json` and apply automatically once it's enabled.
+Restart Claude Code, then run `/adversarial-review`. **That's it** — permissions and the workflow engine are set up automatically and stay current on every update.
 
-> **Fallback:** if `/adversarial-review` ever reports the workflow isn't found (e.g. you run with hooks disabled), drop the engine in by hand:
-> ```bash
-> curl -o ~/.claude/workflows/adversarial-review.js \
->   https://raw.githubusercontent.com/farnell/claude-plugins/main/adversarial-review/workflows/adversarial-review.js
-> ```
+<details>
+<summary>How it works / troubleshooting</summary>
+
+Claude Code plugins can't register workflows directly, so the engine ships *inside* the plugin and a bundled `SessionStart` hook copies it into `~/.claude/workflows/` on every session start (installs on first run, re-syncs the latest on every update). The Bash permissions the review needs (`codex exec`, `gh`, `mktemp`, …) ride in the plugin's `settings.json`.
+
+If `/adversarial-review` ever reports the workflow isn't found (e.g. you run with hooks disabled), drop the engine in by hand:
+
+```bash
+curl -o ~/.claude/workflows/adversarial-review.js \
+  https://raw.githubusercontent.com/farnell/claude-plugins/main/adversarial-review/workflows/adversarial-review.js
+```
+
+</details>
 
 ### Usage
 
