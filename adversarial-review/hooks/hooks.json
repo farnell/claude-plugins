@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p \"$HOME/.claude/workflows\" && cp -f \"${CLAUDE_PLUGIN_ROOT}/workflows/adversarial-review.js\" \"$HOME/.claude/workflows/adversarial-review.js\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}

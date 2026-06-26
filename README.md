@@ -23,20 +23,18 @@ Assumes you already run both, authenticated:
 ### Install
 
 ```bash
-# 1. add this marketplace (once)
 /plugin marketplace add farnell/claude-plugins
-
-# 2. install the command + permissions
 /plugin install adversarial-review@farnell-plugins
-
-# 3. drop in the workflow engine
-#    (the one manual step — Claude Code plugins can't bundle workflows, so the
-#     engine is copied into ~/.claude/workflows/ rather than installed by /plugin)
-curl -o ~/.claude/workflows/adversarial-review.js \
-  https://raw.githubusercontent.com/farnell/claude-plugins/main/adversarial-review/workflows/adversarial-review.js
+# then restart Claude Code
 ```
 
-The Bash permissions the workflow needs (`codex exec`, `gh`, `mktemp`, …) ship in the plugin's `settings.json` and apply automatically once it's enabled.
+That's it. Claude Code plugins can't register workflows directly, so the engine ships *inside* the plugin and a bundled `SessionStart` hook copies it into `~/.claude/workflows/` on every session start — installing, and keeping it current on every update, with no manual step. The Bash permissions the workflow needs (`codex exec`, `gh`, `mktemp`, …) ship in the plugin's `settings.json` and apply automatically once it's enabled.
+
+> **Fallback:** if `/adversarial-review` ever reports the workflow isn't found (e.g. you run with hooks disabled), drop the engine in by hand:
+> ```bash
+> curl -o ~/.claude/workflows/adversarial-review.js \
+>   https://raw.githubusercontent.com/farnell/claude-plugins/main/adversarial-review/workflows/adversarial-review.js
+> ```
 
 ### Usage
 
@@ -101,22 +99,24 @@ npm test
 
 Updates are **version-gated**: `/plugin update` compares the installed `version` against the marketplace, so a push with no version bump is invisible to users. To ship a change:
 
-1. Edit the files under `adversarial-review/`.
-2. **Bump `version`** in BOTH `adversarial-review/.claude-plugin/plugin.json` and the entry in `.claude-plugin/marketplace.json` (keep them equal).
+1. Edit the files under `adversarial-review/` — including `workflows/adversarial-review.js`; the engine is bundled, so a workflow change ships like any other.
+2. **Bump `version`** in BOTH `adversarial-review/.claude-plugin/plugin.json` and the entry in `.claude-plugin/marketplace.json` (keep them equal) — updates are version-gated, so an un-bumped push is invisible to `/plugin update`.
 3. Validate: `claude plugin validate ./adversarial-review && claude plugin validate .`
 4. Commit and push to `main`.
 
-⚠️ **If the change touched `workflows/adversarial-review.js`, that's not enough.** Plugins can't register workflows, so the engine lives at `~/.claude/workflows/` and is updated by the README's `curl` step, NOT by `/plugin update`. A workflow change means users must re-run the curl. Changes confined to the command/permissions update cleanly via `/plugin update` alone.
+The `SessionStart` hook re-syncs the (now updated) engine from the plugin cache into `~/.claude/workflows/` on the user's next session — no separate engine release, no re-curl.
 
 ### Getting updates (user)
 
+With auto-update on (see below), there's nothing to do — Claude Code refreshes the plugin on startup and the hook re-syncs the engine. To pull manually:
+
 ```bash
-/plugin marketplace update farnell-plugins      # refresh the catalog first
-/plugin update adversarial-review@farnell-plugins
-# if the release notes say the engine changed, also re-run the curl from Install step 3
+/plugin marketplace update farnell-plugins                # refresh the catalog first
+/plugin update adversarial-review@farnell-plugins         # the @marketplace qualifier is required
+# restart so the SessionStart hook syncs the updated engine
 ```
 
-**Auto-update:** off by default for third-party marketplaces like this one (only Anthropic's official marketplaces auto-update out of the box). To opt in, open `/plugin` → Marketplaces → select `farnell-plugins` → **Enable auto-update** (refreshes + updates on Claude Code startup). It still won't touch the curl-installed engine.
+**Auto-update:** off by default for third-party marketplaces like this one (only Anthropic's official marketplaces auto-update out of the box). Opt in via `/plugin` → Marketplaces → select `farnell-plugins` → **Enable auto-update**, or add `"autoUpdate": true` to the marketplace entry under `extraKnownMarketplaces` in `~/.claude/settings.json`.
 
 ## License
 

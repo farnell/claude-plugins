@@ -10,7 +10,7 @@
       "name": "adversarial-review",
       "source": "./adversarial-review",
       "description": "Adversarial Claude + Codex code review of a markdown file or GitHub PR — runs up to N rounds, machine-verifies every citation, synthesizes, then asks permission to continue. Resumable from disk.",
-      "version": "1.0.1"
+      "version": "1.0.2"
     }
   ]
 }
