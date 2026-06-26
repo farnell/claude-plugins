@@ -97,6 +97,27 @@ npm install
 npm test
 ```
 
+### Releasing an update (maintainer)
+
+Updates are **version-gated**: `/plugin update` compares the installed `version` against the marketplace, so a push with no version bump is invisible to users. To ship a change:
+
+1. Edit the files under `adversarial-review/`.
+2. **Bump `version`** in BOTH `adversarial-review/.claude-plugin/plugin.json` and the entry in `.claude-plugin/marketplace.json` (keep them equal).
+3. Validate: `claude plugin validate ./adversarial-review && claude plugin validate .`
+4. Commit and push to `main`.
+
+⚠️ **If the change touched `workflows/adversarial-review.js`, that's not enough.** Plugins can't register workflows, so the engine lives at `~/.claude/workflows/` and is updated by the README's `curl` step, NOT by `/plugin update`. A workflow change means users must re-run the curl. Changes confined to the command/permissions update cleanly via `/plugin update` alone.
+
+### Getting updates (user)
+
+```bash
+/plugin marketplace update farnell-plugins      # refresh the catalog first
+/plugin update adversarial-review@farnell-plugins
+# if the release notes say the engine changed, also re-run the curl from Install step 3
+```
+
+**Auto-update:** off by default for third-party marketplaces like this one (only Anthropic's official marketplaces auto-update out of the box). To opt in, open `/plugin` → Marketplaces → select `farnell-plugins` → **Enable auto-update** (refreshes + updates on Claude Code startup). It still won't touch the curl-installed engine.
+
 ## License
 
 [MIT](LICENSE)
