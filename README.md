@@ -113,6 +113,8 @@ Updates are **version-gated**: `/plugin update` compares the installed `version`
 
 The `SessionStart` hook re-syncs the (now updated) engine from the plugin cache into `~/.claude/workflows/` on the user's next session — no separate engine release, no re-curl.
 
+**Safety net (so step 2 can't be forgotten):** a tracked `pre-push` hook (`.githooks/pre-push`) refuses any push to `main` that changes `adversarial-review/` content without bumping the version, and also blocks a mismatch between the two version fields. It activates automatically on `npm install` (via the `prepare` script); to activate it by hand in a fresh clone run `git config core.hooksPath .githooks`. A vitest test (`npm test`) independently asserts the two versions stay equal. Override the hook in a pinch with `git push --no-verify`.
+
 ### Getting updates (user)
 
 With auto-update on (see below), there's nothing to do — Claude Code refreshes the plugin on startup and the hook re-syncs the engine. To pull manually:
