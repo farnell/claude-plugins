@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Pre-push guard for the farnell-plugins marketplace.
+#
+# Why this exists: plugin updates are VERSION-GATED. Claude Code's
+# `/plugin update` compares the installed `version` against the marketplace
+# catalog, so a push that changes plugin content WITHOUT bumping the version
+# is invisible to every installed user — including you. This hook refuses
+# such a push to `main` before it can silently ship nothing.
+#
+# It also enforces that the two version fields stay equal:
+#   adversarial-review/.claude-plugin/plugin.json  -> .version
+#   .claude-plugin/marketplace.json                -> plugins[name==adversarial-review].version
+#
+# Scope: only pushes to refs/heads/main are guarded; feature branches push freely.
+# Dev-only files (adversarial-review/dev/**) and repo tooling don't count as
+# plugin content. Bypass in a pinch with:  git push --no-verify
+#
+# Activate (once per clone):  git config core.hooksPath .githooks
+
+plugin="adversarial-review"
+manifest="$plugin/.claude-plugin/plugin.json"
+catalog=".claude-plugin/marketplace.json"
+protected="refs/heads/main"
+zero="0000000000000000000000000000000000000000"
+
+ver_plugin()  { git show "$1:$manifest" 2>/dev/null | jq -r '.version // empty' 2>/dev/null; }
+ver_catalog() { git show "$1:$catalog"  2>/dev/null | jq -r --arg n "$plugin" '.plugins[] | select(.name==$n) | .version // empty' 2>/dev/null; }
+
+status=0
+while read -r _local_ref local_sha remote_ref remote_sha; do
+  [ "$remote_ref" = "$protected" ] || continue   # only guard main
+  [ "$local_sha" = "$zero" ]       && continue   # branch deletion — allow
+
+  if [ "$remote_sha" = "$zero" ]; then
+    base="$(git rev-parse origin/main 2>/dev/null || true)"
+  else
+    base="$remote_sha"
+  fi
+  [ -n "$base" ] || continue                     # nothing to diff against — allow
+
+  # Did published plugin content change (ignoring dev-only files)?
+  if git diff --quiet "$base" "$local_sha" -- "$plugin" ":(exclude)$plugin/dev"; then
+    continue                                      # no plugin change — nothing to gate
+  fi
+
+  old="$(ver_plugin "$base")"
+  new="$(ver_plugin "$local_sha")"
+  if [ -z "$new" ]; then
+    echo "✗ pre-push blocked: can't read version from $manifest at the pushed commit." >&2
+    status=1; continue
+  fi
+  if [ "$old" = "$new" ]; then
+    echo "✗ pre-push blocked: $plugin/ changed but version is still $new." >&2
+    echo "  Updates are version-gated — an un-bumped push ships nothing to users." >&2
+    echo "  Bump 'version' in BOTH:" >&2
+    echo "    $manifest" >&2
+    echo "    $catalog" >&2
+    echo "  then commit. (Override with: git push --no-verify)" >&2
+    status=1; continue
+  fi
+
+  cat_new="$(ver_catalog "$local_sha")"
+  if [ "$cat_new" != "$new" ]; then
+    echo "✗ pre-push blocked: version mismatch at the pushed commit —" >&2
+    echo "    $manifest  = $new" >&2
+    echo "    $catalog   = ${cat_new:-<missing>}" >&2
+    echo "  Set both to the same version, then commit. (Override: git push --no-verify)" >&2
+    status=1; continue
+  fi
+
+  echo "✓ pre-push: $plugin version $old → $new (catalog in sync)" >&2
+done
+
+exit "$status"

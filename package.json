@@ -4,6 +4,7 @@
   "type": "module",
   "description": "Dev-only tooling for the claude-plugins marketplace (drift-guard tests). Not required to use any plugin.",
   "scripts": {
+    "prepare": "git config core.hooksPath .githooks || true",
     "test": "vitest run"
   },
   "devDependencies": {
