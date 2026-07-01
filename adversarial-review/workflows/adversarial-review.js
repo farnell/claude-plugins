@@ -15,7 +15,8 @@ export const meta = {
 // forbids import(), so these are duplicated here and drift-guarded for exact
 // behavioural parity by dev/__tests__/core.test.ts.
 // KEEP IN SYNC with core.ts — edit both or the drift-guard test fails.
-const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/
+// (core.ts's UUID_RE + extractThreadId are not mirrored — the workflow captures
+//  the thread id in-bash via grep, not from this module.)
 function parseArgs(a) {
   if (typeof a === 'string') {
     const t = a.trim()
@@ -49,10 +50,17 @@ function parseCodex(raw) {
     ? raw.split('@@@CODEX_OUTPUT@@@').slice(1).join('@@@CODEX_OUTPUT@@@')
     : raw
   const sidParts = afterOut.split('@@@CODEX_SESSION_ID@@@')
-  const sessionId = sidParts.length > 1
-    ? ((sidParts[sidParts.length - 1] || '').match(UUID_RE)?.[0] || null)
-    : null
   const content = (sidParts.length > 1 ? sidParts.slice(0, -1).join('@@@CODEX_SESSION_ID@@@') : afterOut).trim()
+  const U = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+  const pickLast = (re) => {
+    let m, last = null
+    while ((m = re.exec(raw)) !== null) last = m[1]
+    return last ? last.toLowerCase() : null
+  }
+  const sessionId =
+    pickLast(new RegExp(`@@@CODEX_SESSION_ID@@@\\s*(${U})\\s*@@@END_SID@@@`, 'gi')) ||
+    pickLast(new RegExp(`@@@CODEX_SESSION_ID@@@\\s*(${U})`, 'gi')) ||
+    pickLast(new RegExp(`(${U})`, 'gi'))
   return { content, sessionId, rc, ok: rc === 0 && content.length > 0 }
 }
 function agreementProblem(cr) {
@@ -183,18 +191,26 @@ const STATE_PATH = `${STATE_DIR}/${makeStateKey(target, isPR, repoRoot)}.json`
 // Repo root derived in-shell (never hard-coded). Exit code captured so a failed
 // codex aborts rather than feeding empty output downstream. Session id captured
 // race-free from this process's own `--json` thread.started event.
+//
+// The session id is emitted SELF-DELIMITING on ONE line —
+// `@@@CODEX_SESSION_ID@@@<uuid>@@@END_SID@@@` — so that even if the
+// general-purpose subagent that relays this stdout reformats or reorders it
+// (issue #4: it hoisted the marker into a header above the output), the marker
+// and uuid travel together as a single token that parseCodex finds regardless of
+// position. Empty-but-fenced (`…@@@@@@END_SID@@@`) on failure yields no uuid, so
+// no false capture.
 const codexInitialCmd = (promptShq) => [
   `ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`,
   `OUT="$(mktemp -t adv_out.XXXXXX)"`,
   `EV="$(mktemp -t adv_ev.XXXXXX)"`,
   `cd "$ROOT" && codex exec --json ${CODEX_FLAGS} --output-last-message "$OUT" ${promptShq} > "$EV" 2>/dev/null`,
   `RC=$?`,
+  `SID=""; [ "$RC" -eq 0 ] && SID="$(grep -o '"thread_id":"[0-9a-f-]\\{36\\}"' "$EV" | head -1 | grep -o '[0-9a-f-]\\{36\\}' | head -1)"`,
   `echo "@@@CODEX_RC@@@$RC"`,
   `echo "@@@CODEX_OUTPUT@@@"`,
   `[ "$RC" -eq 0 ] && cat "$OUT"`,
   `echo`,
-  `echo "@@@CODEX_SESSION_ID@@@"`,
-  `[ "$RC" -eq 0 ] && grep -o '"thread_id":"[0-9a-f-]\\{36\\}"' "$EV" | head -1`,
+  `echo "@@@CODEX_SESSION_ID@@@$SID@@@END_SID@@@"`,
   `rm -f "$OUT" "$EV"`,
 ].join('\n')
 

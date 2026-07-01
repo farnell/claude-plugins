@@ -78,9 +78,22 @@ export interface CodexResult { content: string; sessionId: string | null; rc: nu
 
 /** Parse a codex-runner subagent's return text. The review body can itself
  *  quote the delimiters (e.g. when Codex reviews this workflow), so OUTPUT is
- *  taken after its FIRST marker (rejoining later quotes) and the session id is
- *  taken from the LAST SESSION_ID fragment (rejoining earlier quotes as body).
- *  Never a 2-element destructure. */
+ *  taken after its FIRST marker (rejoining later quotes). Never a 2-element
+ *  destructure.
+ *
+ *  Session-id capture is ORDER-INDEPENDENT (issue #4). The general-purpose
+ *  subagent that runs the codex bash acts as an untrusted transport: it can
+ *  reformat the raw stdout and, in the wild, hoisted `@@@CODEX_SESSION_ID@@@`
+ *  (uuid inline, space-separated) into a header block ABOVE `@@@CODEX_OUTPUT@@@`.
+ *  The old parser read the id only from the text AFTER `@@@CODEX_OUTPUT@@@`, so a
+ *  reordered marker vanished → codexSessionId=null → resume_failed after round 1.
+ *  We now scan the WHOLE raw, most-specific first, taking the LAST match at each
+ *  tier (the real id is emitted last, so a body that QUOTES an earlier marker or
+ *  uuid cannot shadow it):
+ *    1. fenced  `@@@CODEX_SESSION_ID@@@<uuid>@@@END_SID@@@`  — the emitted form;
+ *       prose that mentions the bare marker won't carry the closing fence.
+ *    2. marker + uuid (any whitespace, any position) — tolerates a stripped fence.
+ *    3. bare trailing uuid — last resort when the marker was stripped entirely. */
 export function parseCodex(raw: string): CodexResult {
   const rcM = raw.match(/@@@CODEX_RC@@@(-?\d+)/)
   const rc = rcM ? parseInt(rcM[1], 10) : null
@@ -88,10 +101,17 @@ export function parseCodex(raw: string): CodexResult {
     ? raw.split('@@@CODEX_OUTPUT@@@').slice(1).join('@@@CODEX_OUTPUT@@@')
     : raw
   const sidParts = afterOut.split('@@@CODEX_SESSION_ID@@@')
-  const sessionId = sidParts.length > 1
-    ? ((sidParts[sidParts.length - 1] || '').match(UUID_RE)?.[0] || null)
-    : null
   const content = (sidParts.length > 1 ? sidParts.slice(0, -1).join('@@@CODEX_SESSION_ID@@@') : afterOut).trim()
+  const U = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+  const pickLast = (re: RegExp): string | null => {
+    let m: RegExpExecArray | null, last: string | null = null
+    while ((m = re.exec(raw)) !== null) last = m[1]
+    return last ? last.toLowerCase() : null
+  }
+  const sessionId =
+    pickLast(new RegExp(`@@@CODEX_SESSION_ID@@@\\s*(${U})\\s*@@@END_SID@@@`, 'gi')) ||
+    pickLast(new RegExp(`@@@CODEX_SESSION_ID@@@\\s*(${U})`, 'gi')) ||
+    pickLast(new RegExp(`(${U})`, 'gi'))
   return { content, sessionId, rc, ok: rc === 0 && content.length > 0 }
 }
 

@@ -120,6 +120,46 @@ describe('parseCodex', () => {
   it('reports failure when content is empty even on rc 0', () => {
     expect(core.parseCodex(mk(0, '', '')).ok).toBe(false)
   })
+
+  // ── issue #4: order-independent session-id capture ──
+  it('captures the session id when a subagent HOISTS the marker above OUTPUT (issue #4)', () => {
+    // The exact shape observed in the wild: the relaying subagent reformatted the
+    // codex stdout, moving @@@CODEX_SESSION_ID@@@ (uuid inline, space-separated)
+    // into a header block ABOVE @@@CODEX_OUTPUT@@@. The old parser read the id only
+    // from after OUTPUT → null → resume_failed after round 1.
+    const raw = `@@@CODEX_RC@@@0
+@@@CODEX_SESSION_ID@@@ 019f1bfd-144e-7f32-8677-3cba2c0a4f13
+
+@@@CODEX_OUTPUT@@@
+**Completed Items** — findings go here.`
+    const r = core.parseCodex(raw)
+    expect(r.ok).toBe(true)
+    expect(r.sessionId).toBe('019f1bfd-144e-7f32-8677-3cba2c0a4f13')
+    expect(r.content).toBe('**Completed Items** — findings go here.')
+  })
+  it('parses the self-delimiting one-line fenced emit form', () => {
+    const raw = `@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings\n\n@@@CODEX_SESSION_ID@@@019ee36e-742e-7272-9252-de4a771df7b2@@@END_SID@@@`
+    const r = core.parseCodex(raw)
+    expect(r.sessionId).toBe('019ee36e-742e-7272-9252-de4a771df7b2')
+    expect(r.content).toBe('findings')
+  })
+  it('prefers the fenced id even when the body merely MENTIONS the bare marker', () => {
+    // Prose in the review (or these very comments) quotes @@@CODEX_SESSION_ID@@@
+    // without a uuid/fence; the real fenced id must still win.
+    const raw = `@@@CODEX_RC@@@0
+@@@CODEX_OUTPUT@@@
+The @@@CODEX_SESSION_ID@@@ marker handling looks fragile.
+
+@@@CODEX_SESSION_ID@@@019ee36e-742e-7272-9252-de4a771df7b2@@@END_SID@@@`
+    expect(core.parseCodex(raw).sessionId).toBe('019ee36e-742e-7272-9252-de4a771df7b2')
+  })
+  it('falls back to a bare trailing uuid when the marker was stripped entirely', () => {
+    const raw = `@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings\nsession 019f1bfd-144e-7f32-8677-3cba2c0a4f13`
+    expect(core.parseCodex(raw).sessionId).toBe('019f1bfd-144e-7f32-8677-3cba2c0a4f13')
+  })
+  it('never captures a session id when none is present', () => {
+    expect(core.parseCodex('@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\njust findings, no uuid anywhere').sessionId).toBeNull()
+  })
 })
 
 // ─── agreementProblem ────────────────────────────────────────────────────────
@@ -265,6 +305,12 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
       '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings\n@@@CODEX_SESSION_ID@@@\n019ee36e-742e-7272-9252-de4a771df7b2',
       '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nquotes @@@CODEX_SESSION_ID@@@ inside\n@@@CODEX_SESSION_ID@@@\n019ee36e-742e-7272-9252-de4a771df7b2',
       '@@@CODEX_RC@@@1\n@@@CODEX_OUTPUT@@@\n\n@@@CODEX_SESSION_ID@@@\n',
+      // issue #4 shapes: hoisted-above-output, fenced one-line, bare-uuid fallback, none
+      '@@@CODEX_RC@@@0\n@@@CODEX_SESSION_ID@@@ 019f1bfd-144e-7f32-8677-3cba2c0a4f13\n\n@@@CODEX_OUTPUT@@@\nfindings',
+      '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings\n\n@@@CODEX_SESSION_ID@@@019ee36e-742e-7272-9252-de4a771df7b2@@@END_SID@@@',
+      '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nThe @@@CODEX_SESSION_ID@@@ marker\n@@@CODEX_SESSION_ID@@@019ee36e-742e-7272-9252-de4a771df7b2@@@END_SID@@@',
+      '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings\nsession 019f1bfd-144e-7f32-8677-3cba2c0a4f13',
+      '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\njust findings, no uuid',
     ]
     for (const v of codexVectors) expect(inline.parseCodex(v)).toEqual(core.parseCodex(v))
 
