@@ -115,17 +115,25 @@ The `SessionStart` hook re-syncs the (now updated) engine from the plugin cache 
 
 **Safety net (so step 2 can't be forgotten):** a tracked `pre-push` hook (`.githooks/pre-push`) refuses any push to `main` that changes `adversarial-review/` content without bumping the version, and also blocks a mismatch between the two version fields. It activates automatically on `npm install` (via the `prepare` script); to activate it by hand in a fresh clone run `git config core.hooksPath .githooks`. A vitest test (`npm test`) independently asserts the two versions stay equal. Override the hook in a pinch with `git push --no-verify`.
 
-### Getting updates (user)
+### Getting updates (maintainer / your own machines)
 
-With auto-update on (see below), there's nothing to do — Claude Code refreshes the plugin on startup and the hook re-syncs the engine. To pull manually:
+**Merging to `main` updates nothing locally.** Three copies must each advance — the marketplace clone, the version-gated cache, and the live engine at `~/.claude/workflows/adversarial-review.js` (what actually runs, synced from the cache by the `SessionStart` hook). The reliable one-command way to pull a merged release:
 
 ```bash
-/plugin marketplace update farnell-plugins                # refresh the catalog first
-/plugin update adversarial-review@farnell-plugins         # the @marketplace qualifier is required
-# restart so the SessionStart hook syncs the updated engine
+scripts/sync-local.sh
 ```
 
-**Auto-update:** off by default for third-party marketplaces like this one (only Anthropic's official marketplaces auto-update out of the box). Opt in via `/plugin` → Marketplaces → select `farnell-plugins` → **Enable auto-update**, or add `"autoUpdate": true` to the marketplace entry under `extraKnownMarketplaces` in `~/.claude/settings.json`.
+Idempotent. It resets the marketplace clone to `origin/main`, rebuilds the cache dir for the released version, repoints `installed_plugins.json`, and syncs the live engine — no restart needed. Verify with `grep -c <your-new-token> ~/.claude/workflows/adversarial-review.js`.
+
+**Don't rely on the TUI or auto-update.** There is no `/plugin update` *command* (typing it just opens the browser), and auto-update **silently no-ops when the marketplace clone is stale or diverged** — and this repo squash-merges, which rewrites history and causes exactly that divergence. The supported-but-flaky path, for completeness:
+
+```bash
+/plugin marketplace update farnell-plugins                # MUST refresh the clone first — the version gate reads it
+/plugin update adversarial-review@farnell-plugins         # via the /plugin TUI; the @marketplace qualifier is required
+# then restart so the SessionStart hook copies the new engine from the cache
+```
+
+For a **workflow-only** change you can skip all of it and pull the engine straight from `main` — that's the `curl` one-liner in the *How it works / troubleshooting* box above.
 
 ## License
 
