@@ -3,16 +3,17 @@
     "allow": [
       "Bash(codex exec:*)",
       "Bash(mktemp:*)",
-      "Bash(sort:*)",
-      "Bash(tail:*)",
-      "Bash(comm:*)",
       "Bash(rm -f:*)",
       "Bash(git rev-parse:*)",
       "Bash(mkdir -p:*)",
       "Bash(find:*)",
       "Bash(grep:*)",
       "Bash(cat:*)",
-      "Bash(gh:*)"
+      "Bash(gh pr view:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr comment:*)",
+      "Bash(gh repo view:*)",
+      "Bash(gh api:*)"
     ]
   }
 }

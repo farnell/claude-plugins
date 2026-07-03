@@ -240,6 +240,35 @@ describe('splitFindingsByCitation', () => {
   })
 })
 
+// ─── summarizeAudit (FAIL CLOSED: resolved ⟺ explicit ok for every requested ref) ─
+describe('summarizeAudit', () => {
+  const refs = ['a.ts:5', 'b.ts:9']
+  it('all ok → nothing unresolved', () => {
+    expect(core.summarizeAudit(refs, [{ ref: 'a.ts:5', status: 'ok' }, { ref: 'b.ts:9', status: 'ok' }]))
+      .toEqual({ checked: 2, unresolved: 0, badRefs: [] })
+  })
+  it('a non-ok status is unresolved', () => {
+    expect(core.summarizeAudit(refs, [{ ref: 'a.ts:5', status: 'ok' }, { ref: 'b.ts:9', status: 'nofile' }]).badRefs).toEqual(['b.ts:9'])
+  })
+  it('fails closed on an EMPTY results[] — previously counted as "all clear"', () => {
+    expect(core.summarizeAudit(refs, [])).toEqual({ checked: 2, unresolved: 2, badRefs: refs })
+  })
+  it('fails closed on a PARTIAL audit — unreported refs count as unresolved', () => {
+    expect(core.summarizeAudit(refs, [{ ref: 'a.ts:5', status: 'ok' }]).badRefs).toEqual(['b.ts:9'])
+  })
+  it('fails closed on conflicting duplicate results for one ref', () => {
+    expect(core.summarizeAudit(['a.ts:5'], [{ ref: 'a.ts:5', status: 'ok' }, { ref: 'a.ts:5', status: 'badline' }]).unresolved).toBe(1)
+  })
+  it('ignores results for refs that were never requested', () => {
+    expect(core.summarizeAudit(['a.ts:5'], [{ ref: 'a.ts:5', status: 'ok' }, { ref: 'evil.ts:1', status: 'ok' }]))
+      .toEqual({ checked: 1, unresolved: 0, badRefs: [] })
+  })
+  it('handles undefined results and empty refs', () => {
+    expect(core.summarizeAudit(refs, undefined)).toEqual({ checked: 2, unresolved: 2, badRefs: refs })
+    expect(core.summarizeAudit([], [])).toEqual({ checked: 0, unresolved: 0, badRefs: [] })
+  })
+})
+
 // ─── postCommentScript (injection-safe + author-scoped idempotent upsert) ─────
 describe('postCommentScript', () => {
   const body = 'hello\n__ADV_COMMENT_EOF__\nrm -rf ~ # not executed\n🔬'
@@ -286,7 +315,7 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
 
   it('inline helpers behave identically to core for every vector', () => {
     const inline: any = new Function(
-      `${block}\n;return { parseArgs, validateTarget, shortHash, makeStateKey, shq, parseCodex, agreementProblem, buildCritique, COMMENT_MARKER, heredocDelim, splitFindingsByCitation, postCommentScript };`
+      `${block}\n;return { parseArgs, validateTarget, shortHash, makeStateKey, shq, parseCodex, agreementProblem, buildCritique, COMMENT_MARKER, heredocDelim, splitFindingsByCitation, summarizeAudit, postCommentScript };`
     )()
 
     const argVectors = [{ target: '249', maxRounds: 3 }, '{"target":"249","resume":true}', 'docs/x.md', '{bad', undefined]
@@ -340,6 +369,15 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
       [[{ citation: 'see c.ts:3 vs a.ts:5' }], [{ ref: 'c.ts:3', status: 'badline' }]],
     ]
     for (const [f, a] of splitVectors) expect(inline.splitFindingsByCitation(f, a)).toEqual(core.splitFindingsByCitation(f, a))
+
+    const auditVectors: Array<[string[], any]> = [
+      [['a.ts:5', 'b.ts:9'], [{ ref: 'a.ts:5', status: 'ok' }, { ref: 'b.ts:9', status: 'ok' }]],
+      [['a.ts:5', 'b.ts:9'], [{ ref: 'a.ts:5', status: 'ok' }]],
+      [['a.ts:5'], []],
+      [['a.ts:5'], [{ ref: 'a.ts:5', status: 'ok' }, { ref: 'a.ts:5', status: 'badline' }]],
+      [[], undefined],
+    ]
+    for (const [r, a] of auditVectors) expect(inline.summarizeAudit(r, a)).toEqual(core.summarizeAudit(r, a))
 
     for (const b of bodyVectors) expect(inline.postCommentScript('256', inline.COMMENT_MARKER, b)).toBe(core.postCommentScript('256', core.COMMENT_MARKER, b))
   })
