@@ -203,6 +203,31 @@ export function splitFindingsByCitation<T extends { citation?: string }>(
   return { confirmed, unresolved }
 }
 
+export interface AuditRollup { checked: number; unresolved: number; badRefs: string[] }
+
+/** FAIL-CLOSED roll-up of the citation audit for logs + result messages. A
+ *  requested ref counts as resolved ONLY when the audit returned at least one
+ *  result for it and every such result is `ok`. Refs the audit never reported
+ *  on — the agent returned an empty or partial results[] — count as unresolved:
+ *  an empty audit must read as "nothing was verified", never "all clear".
+ *  Results for refs that were never requested are ignored. This mirrors the
+ *  contract of splitFindingsByCitation (which buckets the PR comment); before
+ *  this helper the checked/unresolved counts were computed from results[] alone
+ *  and failed OPEN on an empty/partial audit while the comment failed closed,
+ *  so the two surfaces could contradict each other. */
+export function summarizeAudit(refs: string[], results: AuditResult[] | undefined): AuditRollup {
+  const statuses = new Map<string, string[]>()
+  for (const r of results || []) {
+    if (!r || !r.ref) continue
+    statuses.set(r.ref, [...(statuses.get(r.ref) || []), r.status])
+  }
+  const badRefs = refs.filter((ref) => {
+    const st = statuses.get(ref)
+    return !st || st.some((s) => s !== 'ok')
+  })
+  return { checked: refs.length, unresolved: badRefs.length, badRefs }
+}
+
 /** Build the bash that upserts the summary comment. Pure string assembly so the
  *  injection-critical bits are unit-testable. The body rides a quoted heredoc
  *  whose delimiter cannot appear in it (heredocDelim) — model text can neither

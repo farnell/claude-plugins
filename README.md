@@ -52,7 +52,7 @@ curl -o ~/.claude/workflows/adversarial-review.js \
 /adversarial-review continue                # approve more rounds from the last checkpoint
 ```
 
-Tuning (optional): pass `effort` (`low`|`medium`|`high`|`xhigh`|`max`) and/or `model` to change the Codex reasoning tier. Defaults are **`high` for PRs, `medium` for files**.
+Tuning (optional): pass `effort` (`low`|`medium`|`high`|`xhigh`|`max`) and/or `model` to change the Codex reasoning tier. Default is **`high`** for both PRs and files (drop to `medium`/`low` for a faster, shallower pass on big files).
 
 <details>
 <summary><strong>Setting up Codex</strong> (optional — skip if <code>codex</code> already works)</summary>
