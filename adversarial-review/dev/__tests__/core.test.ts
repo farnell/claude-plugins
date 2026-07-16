@@ -122,6 +122,9 @@ describe('parseCodex', () => {
   it('reports failure when content is empty even on rc 0', () => {
     expect(core.parseCodex(mk(0, '', '')).ok).toBe(false)
   })
+  it('an empty string (the workflow guards a null agent() result to "") reads as a failed run — rc null, ok false', () => {
+    expect(core.parseCodex('')).toEqual({ content: '', sessionId: null, rc: null, ok: false, stderr: '' })
+  })
 
   // ── issue #4: order-independent session-id capture ──
   it('captures the session id when a subagent HOISTS the marker above OUTPUT (issue #4)', () => {
@@ -265,15 +268,16 @@ describe('codexHarvestCmd', () => {
   it('the stderr tail is gated on failure', () => {
     expect(core.codexHarvestCmd('/t/adv_run.x', true)).toContain('if [ "$RC" != "0" ] && [ -s "$D/stderr.log" ]; then')
   })
-  it('rm -rf is guarded by the mktemp prefix pattern and is the ONLY rm in the script', () => {
+  it('cleanup is prefix-guarded rm -f of the four known flat files + rmdir — NEVER rm -rf (no standing rm -rf grant needed)', () => {
     const s = core.codexHarvestCmd('/tmp/adv_run.abc', true)
-    expect(s).toContain('case "$D" in */adv_run.*) rm -rf "$D";; esac')
+    expect(s).toContain('case "$D" in */adv_run.*) rm -f "$D"/out "$D"/events.json "$D"/stderr.log "$D"/rc && rmdir "$D" 2>/dev/null;; esac')
+    expect(s).not.toContain('rm -rf')
     expect(s.match(/rm /g)).toHaveLength(1)
   })
   it('every marker is emitted BEFORE the run dir is removed', () => {
     const s = core.codexHarvestCmd('/tmp/adv_run.abc', true)
     for (const marker of ['@@@CODEX_RC@@@', '@@@CODEX_OUTPUT@@@', '@@@END_STDERR@@@', '@@@END_SID@@@']) {
-      expect(s.indexOf(marker)).toBeLessThan(s.indexOf('rm -rf'))
+      expect(s.indexOf(marker)).toBeLessThan(s.indexOf('rm -f'))
     }
   })
 
@@ -575,6 +579,35 @@ describe('summarizeAudit', () => {
   })
 })
 
+// ─── linkifyCitation (GitHub permalinks for audit-confirmed refs only) ────────
+describe('linkifyCitation', () => {
+  const OK = new Set(['a.ts:5', 'src/b.ts:12'])
+  const SLUG = 'farnell/claude-plugins'
+  const OID = 'deadbeefcafe'
+  it('rewrites an ok ref as a markdown permalink', () => {
+    expect(core.linkifyCitation('a.ts:5', SLUG, OID, OK))
+      .toBe('[a.ts:5](https://github.com/farnell/claude-plugins/blob/deadbeefcafe/a.ts#L5)')
+  })
+  it('multi-ref citations: ok refs get links, non-ok refs stay bare', () => {
+    expect(core.linkifyCitation('see a.ts:5 vs c.ts:9', SLUG, OID, OK))
+      .toBe('see [a.ts:5](https://github.com/farnell/claude-plugins/blob/deadbeefcafe/a.ts#L5) vs c.ts:9')
+  })
+  it('a ref NOT in the ok set is never linkified (no false credibility)', () => {
+    expect(core.linkifyCitation('c.ts:9', SLUG, OID, OK)).toBe('c.ts:9')
+  })
+  it('empty slug or oid is a no-op', () => {
+    expect(core.linkifyCitation('a.ts:5', '', OID, OK)).toBe('a.ts:5')
+    expect(core.linkifyCitation('a.ts:5', SLUG, '', OK)).toBe('a.ts:5')
+  })
+  it('paths with directories link with the full path', () => {
+    expect(core.linkifyCitation('src/b.ts:12', SLUG, OID, OK))
+      .toBe('[src/b.ts:12](https://github.com/farnell/claude-plugins/blob/deadbeefcafe/src/b.ts#L12)')
+  })
+  it('prose without a file:line ref passes through unchanged', () => {
+    expect(core.linkifyCitation('the PR diff hunk for foo', SLUG, OID, OK)).toBe('the PR diff hunk for foo')
+  })
+})
+
 // ─── postCommentScript (injection-safe + author-scoped idempotent upsert) ─────
 describe('postCommentScript', () => {
   const body = 'hello\n__ADV_COMMENT_EOF__\nrm -rf ~ # not executed\n🔬'
@@ -624,7 +657,7 @@ describe('buildCommentBody', () => {
   }
 
   it('carries the marker, status counts, and fail-closed confirmed/unverified buckets', () => {
-    const body = core.buildCommentBody(syn, audit, true, 2, false, 'gpt-5.6-sol')
+    const body = core.buildCommentBody(syn, audit, true, 2, false, 'gpt-5.6-sol', '', '')
     expect(body).toContain(core.COMMENT_MARKER)
     expect(body).toContain('## 🔬 Adversarial review — Codex (gpt-5.6-sol) × Claude')
     expect(body).toContain('✅ Full agreement after 2 round(s)')
@@ -636,13 +669,13 @@ describe('buildCommentBody', () => {
     expect(body).toContain('1. do x first')
   })
   it('audit caveat is checkout-relative when auditedPrHead=false (keeps the not-on-this-branch excuse)', () => {
-    const body = core.buildCommentBody(syn, audit, true, 2, false, 'm')
+    const body = core.buildCommentBody(syn, audit, true, 2, false, 'm', '', '')
     expect(body).toContain('did not resolve against the current checkout')
     expect(body).toContain('not on this branch')
     expect(body).not.toContain('PR head')
   })
   it('audit caveat says PR head when auditedPrHead=true — the branch-mismatch excuse disappears', () => {
-    const body = core.buildCommentBody(syn, audit, true, 2, true, 'm')
+    const body = core.buildCommentBody(syn, audit, true, 2, true, 'm', '', '')
     expect(body).toContain('did not resolve against the PR head')
     expect(body).not.toContain('not on this branch')
     expect(body).not.toContain('current checkout')
@@ -650,15 +683,42 @@ describe('buildCommentBody', () => {
   it('no audit caveat when everything resolved (either locus)', () => {
     const clean: core.CitationAuditLike = { checked: 1, unresolved: 0, badRefs: [], results: [{ ref: 'a.ts:5', status: 'ok' }] }
     for (const flag of [true, false]) {
-      const body = core.buildCommentBody(syn, clean, false, 3, flag, 'm')
+      const body = core.buildCommentBody(syn, clean, false, 3, flag, 'm', '', '')
       expect(body).toContain('⚠️ 3 round(s), no full agreement')
       expect(body).not.toContain('did not resolve')
     }
   })
   it('tolerates an empty synthesis and a missing audit (everything unverified, no caveat)', () => {
-    const body = core.buildCommentBody({}, undefined, false, 0, false, 'm')
+    const body = core.buildCommentBody({}, undefined, false, 0, false, 'm', '', '')
     expect(body).toContain('_None._')
     expect(body).toContain('**0** confirmed · **0** unverified · **0** disputed')
+  })
+  it('permalinks audit-confirmed refs when slug + oid are known, dropping the backticks; unconfirmed refs keep the plain backticked form', () => {
+    const body = core.buildCommentBody(syn, audit, true, 2, true, 'm', 'o/r', 'abc123')
+    // a.ts:5 is ok → linkified, no backticks around the link
+    expect(body).toContain(' [a.ts:5](https://github.com/o/r/blob/abc123/a.ts#L5)')
+    expect(body).not.toContain('`[a.ts:5]')
+    // b.ts:9 is nofile → stays backticked plain text
+    expect(body).toContain(' `b.ts:9`')
+    expect(body).not.toContain('blob/abc123/b.ts')
+  })
+  it('no slug or oid → every citation stays backticked (no permalinks)', () => {
+    for (const [slug, oid] of [['', 'abc123'], ['o/r', ''], ['', '']]) {
+      const body = core.buildCommentBody(syn, audit, true, 2, true, 'm', slug, oid)
+      expect(body).toContain('`a.ts:5`')
+      expect(body).not.toContain('https://github.com/')
+    }
+  })
+  it('renders a refuterNote as a shield sub-line under the finding', () => {
+    const synWithNote: core.SynthesisLike = {
+      agreedFindings: [{ finding: 'F-doubt', severity: 'low', actionItem: 'act', citation: 'a.ts:5', refuterNote: 'maybe intended behaviour' }],
+      unresolvedPoints: [],
+      prioritizedActionItems: [],
+    }
+    const body = core.buildCommentBody(synWithNote, audit, true, 1, false, 'm', '', '')
+    expect(body).toContain('  - 🛡️ refuter (low confidence): maybe intended behaviour')
+    // the note renders after its finding line
+    expect(body.indexOf('F-doubt')).toBeLessThan(body.indexOf('🛡️ refuter'))
   })
 })
 
@@ -779,7 +839,7 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
 
   it('inline helpers behave identically to core for every vector', () => {
     const inline: any = new Function(
-      `${block}\n;return { parseArgs, validateTarget, shortHash, makeStateKey, shq, parseCodex, codexLaunchCmd, codexPollCmd, codexHarvestCmd, shouldRetryCodex, agreementProblem, buildCritique, decideResumeAction, checkStaleness, COMMENT_MARKER, heredocDelim, splitFindingsByCitation, summarizeAudit, postCommentScript, buildCommentBody, renderBlindReview, selectRefutationIndices, applyRefutations };`
+      `${block}\n;return { parseArgs, validateTarget, shortHash, makeStateKey, shq, parseCodex, codexLaunchCmd, codexPollCmd, codexHarvestCmd, shouldRetryCodex, agreementProblem, buildCritique, decideResumeAction, checkStaleness, COMMENT_MARKER, heredocDelim, splitFindingsByCitation, summarizeAudit, postCommentScript, linkifyCitation, buildCommentBody, renderBlindReview, selectRefutationIndices, applyRefutations };`
     )()
 
     const argVectors = [{ target: '249', maxRounds: 3 }, '{"target":"249","resume":true}', 'docs/x.md', '{bad', undefined]
@@ -812,6 +872,7 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
       '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings here\n@@@CODEX_STDERR@@@warning: slow@@@END_STDERR@@@\n@@@CODEX_SESSION_ID@@@019ee36e-742e-7272-9252-de4a771df7b2@@@END_SID@@@',
       '@@@CODEX_RC@@@1\n@@@CODEX_STDERR@@@@@@END_STDERR@@@',
       '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nprose mentions @@@CODEX_STDERR@@@ without a fence',
+      '', // null agent() result, guarded to '' by runCodexAgent
     ]
     for (const v of codexVectors) expect(inline.parseCodex(v)).toEqual(core.parseCodex(v))
 
@@ -900,13 +961,28 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
 
     for (const b of bodyVectors) expect(inline.postCommentScript('256', inline.COMMENT_MARKER, b)).toBe(core.postCommentScript('256', core.COMMENT_MARKER, b))
 
-    // buildCommentBody (severity sort, fail-closed buckets, audit-locus caveat)
+    // linkifyCitation (permalinks for audit-confirmed refs only)
+    const okSet = new Set(['a.ts:5', 'src/b.ts:12'])
+    const linkifyVectors: Array<[string, string, string]> = [
+      ['a.ts:5', 'o/r', 'abc123'],                       // ok ref → link
+      ['see a.ts:5 vs c.ts:9', 'o/r', 'abc123'],         // multi-ref: only the ok one links
+      ['c.ts:9', 'o/r', 'abc123'],                       // non-ok ref stays bare
+      ['a.ts:5', '', 'abc123'],                          // empty slug → no-op
+      ['a.ts:5', 'o/r', ''],                             // empty oid → no-op
+      ['src/b.ts:12', 'farnell/claude-plugins', 'deadbeef'],
+      ['prose with no ref', 'o/r', 'abc123'],
+    ]
+    for (const [c4, sl, oi] of linkifyVectors) expect(inline.linkifyCitation(c4, sl, oi, okSet)).toBe(core.linkifyCitation(c4, sl, oi, okSet))
+
+    // buildCommentBody (severity sort, fail-closed buckets, audit-locus caveat,
+    // permalinks, refuterNote sub-line)
     const synV = {
       summary: 'sum\nmary',
       agreedFindings: [
         { finding: 'F-ok', severity: 'high', actionItem: 'fix', citation: 'a.ts:5' },
         { finding: 'F-bad', severity: 'critical', actionItem: 'check', citation: 'b.ts:9' },
         { finding: 'F-prose', severity: 'weird', citation: 'no ref here' },
+        { finding: 'F-doubt', severity: 'low', citation: 'a.ts:5', refuterNote: 'maybe intended' },
       ],
       unresolvedPoints: [{ point: 'P', codexView: 'cv', claudeView: 'clv' }],
       prioritizedActionItems: ['do x'],
@@ -915,13 +991,14 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
       checked: 2, unresolved: 1, badRefs: ['b.ts:9'],
       results: [{ ref: 'a.ts:5', status: 'ok' }, { ref: 'b.ts:9', status: 'nofile' }],
     }
-    const commentVectors: Array<[any, any, boolean, number, boolean, string]> = [
-      [synV, auditV, true, 2, false, 'gpt-5.6-sol'],
-      [synV, auditV, true, 2, true, 'gpt-5.6-sol'],
-      [synV, { checked: 1, unresolved: 0, badRefs: [], results: [{ ref: 'a.ts:5', status: 'ok' }] }, false, 3, true, 'some-other-model'],
-      [{}, undefined, false, 0, false, ''],
+    const commentVectors: Array<[any, any, boolean, number, boolean, string, string, string]> = [
+      [synV, auditV, true, 2, false, 'gpt-5.6-sol', '', ''],
+      [synV, auditV, true, 2, true, 'gpt-5.6-sol', 'o/r', 'abc123'],
+      [synV, auditV, true, 2, true, 'gpt-5.6-sol', '', 'abc123'],
+      [synV, { checked: 1, unresolved: 0, badRefs: [], results: [{ ref: 'a.ts:5', status: 'ok' }] }, false, 3, true, 'some-other-model', 'farnell/claude-plugins', 'deadbeef'],
+      [{}, undefined, false, 0, false, '', '', ''],
     ]
-    for (const [sy, au, ag, ro, ph, mn] of commentVectors) expect(inline.buildCommentBody(sy, au, ag, ro, ph, mn)).toBe(core.buildCommentBody(sy, au, ag, ro, ph, mn))
+    for (const [sy, au, ag, ro, ph, mn, sl, oi] of commentVectors) expect(inline.buildCommentBody(sy, au, ag, ro, ph, mn, sl, oi)).toBe(core.buildCommentBody(sy, au, ag, ro, ph, mn, sl, oi))
 
     // renderBlindReview (blind round-1 → history text)
     const blindVectors = [

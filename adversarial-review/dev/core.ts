@@ -183,7 +183,11 @@ export function codexPollCmd(runDir: string): string {
  *  @@@CODEX_STDERR@@@ 2000-byte tail on failure, and (initial only) the
  *  session id grepped from the --json event stream, fenced self-delimiting on
  *  one line. Ends by removing the run dir, guarded so only a path matching
- *  the mktemp template (basename starts with `adv_run.`) is ever rm -rf'd. */
+ *  the mktemp template (basename starts with `adv_run.`) is ever touched.
+ *  Cleanup is deliberately rm -f of the four known flat files + rmdir — never
+ *  rm -rf — so the shipped permission allowlist needs no standing
+ *  `Bash(rm -rf:*)` grant (rm -f is already allowlisted; an unexpected extra
+ *  file just leaves the dir behind for tmp reaping). */
 export function codexHarvestCmd(runDir: string, initial: boolean): string {
   const lines = [
     `D=${shq(runDir)}`,
@@ -200,7 +204,7 @@ export function codexHarvestCmd(runDir: string, initial: boolean): string {
       `echo "@@@CODEX_SESSION_ID@@@$SID@@@END_SID@@@"`,
     )
   }
-  lines.push(`case "$D" in */adv_run.*) rm -rf "$D";; esac`)
+  lines.push(`case "$D" in */adv_run.*) rm -f "$D"/out "$D"/events.json "$D"/stderr.log "$D"/rc && rmdir "$D" 2>/dev/null;; esac`)
   return lines.join('\n')
 }
 
@@ -451,13 +455,29 @@ export function postCommentScript(target: string, marker: string, body: string):
   ].join('\n')
 }
 
+/** Rewrite `file:line` refs inside a citation string as GitHub permalinks
+ *  (`[file:line](https://github.com/<slug>/blob/<oid>/<file>#L<line>)`).
+ *  ONLY refs in `okRefs` (the citation audit's status==='ok' set) are linkified
+ *  — linkifying an unresolved ref would lend it false credibility — and refs
+ *  containing `..` are skipped (CITE_RE's charset admits them; the audit
+ *  filters them, so they can never be ok, but skip defensively). When the repo
+ *  slug or head oid is unknown (empty), the citation is returned unchanged. */
+export function linkifyCitation(citation: string, repoSlug: string, headOid: string, okRefs: Set<string>): string {
+  if (!repoSlug || !headOid) return String(citation)
+  return String(citation).replace(CITE_RE, (m, file, line) => {
+    const ref = `${file}:${line}`
+    if (file.includes('..') || !okRefs.has(ref)) return m
+    return `[${ref}](https://github.com/${repoSlug}/blob/${headOid}/${file}#L${line})`
+  })
+}
+
 // ─── Summary-comment renderer ────────────────────────────────────────────────
 const SEV_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 }
 const SEV_BADGE: Record<string, string> = { critical: '🔴 critical', high: '🟠 high', medium: '🟡 medium', low: '⚪ low' }
 
 export interface SynthesisLike {
   summary?: string
-  agreedFindings?: Array<{ finding?: string; severity?: string; actionItem?: string; citation?: string }>
+  agreedFindings?: Array<{ finding?: string; severity?: string; actionItem?: string; citation?: string; refuterNote?: string }>
   unresolvedPoints?: Array<{ point?: string; codexView?: string; claudeView?: string }>
   prioritizedActionItems?: string[]
 }
@@ -471,8 +491,12 @@ export interface CitationAuditLike { checked: number; unresolved: number; badRef
  *  current checkout (the fallback when no worktree could be created), where a
  *  ref may fail to resolve simply because the PR branch is not checked out.
  *  `modelName` is the Codex model id rendered in the heading (the caller's
- *  validated CODEX_MODEL) — no hardcoded model string here. */
-export function buildCommentBody(syn: SynthesisLike, audit: CitationAuditLike | undefined | null, didAgree: boolean, rounds: number, auditedPrHead: boolean, modelName: string): string {
+ *  validated CODEX_MODEL) — no hardcoded model string here. `repoSlug` +
+ *  `headOid` (both '' when unknown / file target) turn audit-confirmed
+ *  `file:line` refs into GitHub permalinks via linkifyCitation; a linkified
+ *  citation drops the backticks (a markdown link inside backticks doesn't
+ *  render), an unlinkified one keeps them. */
+export function buildCommentBody(syn: SynthesisLike, audit: CitationAuditLike | undefined | null, didAgree: boolean, rounds: number, auditedPrHead: boolean, modelName: string, repoSlug: string, headOid: string): string {
   const sorted = [...(syn.agreedFindings || [])].sort(
     (a, b) => (SEV_RANK[a.severity ?? ''] ?? 9) - (SEV_RANK[b.severity ?? ''] ?? 9)
   )
@@ -481,9 +505,15 @@ export function buildCommentBody(syn: SynthesisLike, audit: CitationAuditLike | 
   // into its own re-check bucket so the comment never contradicts itself.
   const { confirmed, unresolved } = splitFindingsByCitation(sorted, audit && audit.results || undefined)
   const disputed = syn.unresolvedPoints || []
-  const fmt = (f: { finding?: string; severity?: string; actionItem?: string; citation?: string }) => {
-    const out = [`- **${SEV_BADGE[f.severity ?? ''] || f.severity || ''}** — ${f.finding}${f.citation ? ` \`${f.citation}\`` : ''}`]
+  // Only audit-confirmed refs get permalinks (linkifyCitation ignores the rest).
+  const okRefs = new Set(((audit && audit.results) || []).filter((r) => r && r.status === 'ok').map((r) => r.ref))
+  const fmt = (f: { finding?: string; severity?: string; actionItem?: string; citation?: string; refuterNote?: string }) => {
+    const cite = f.citation ? String(f.citation) : ''
+    const linked = cite ? linkifyCitation(cite, repoSlug, headOid, okRefs) : ''
+    const citePart = cite ? (linked !== cite ? ` ${linked}` : ` \`${cite}\``) : ''
+    const out = [`- **${SEV_BADGE[f.severity ?? ''] || f.severity || ''}** — ${f.finding}${citePart}`]
     if (f.actionItem) out.push(`  - ↳ ${f.actionItem}`)
+    if (f.refuterNote) out.push(`  - 🛡️ refuter (low confidence): ${f.refuterNote}`)
     return out
   }
   const L = [COMMENT_MARKER, `## 🔬 Adversarial review — Codex (${modelName}) × Claude`, '']

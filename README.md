@@ -6,7 +6,7 @@ A small marketplace of [Claude Code](https://docs.claude.com/en/docs/claude-code
 
 ## adversarial-review
 
-Two models review the same target and argue until they agree. **Codex (`gpt-5.5`)** produces an initial review; **Claude** independently audits each finding against the source, sends a critique back, and the loop repeats for up to N rounds. The result is synthesized into confirmed findings, a disputed set, and prioritized actions — and **every `file:line` citation is machine-checked against the repo** so a hallucinated reference can't be labelled "confirmed".
+Two models review the same target and argue until they agree. **Codex** and a **blind Claude pass** review the target independently in parallel; Claude then audits each Codex finding against the source, sends a critique back, and the loop repeats for up to N rounds. The result is synthesized into confirmed findings, a disputed set, and prioritized actions — **every `file:line` citation is machine-checked against the repo** (against the PR head for PR targets) so a hallucinated reference can't be labelled "confirmed", and a fresh-context **refuter pass** then tries to overturn each agreed finding so two models converging on something plausible-but-wrong gets caught too.
 
 - Reviews either a **markdown file** (`docs/architecture.md`) or a **GitHub PR** (`260`).
 - **Resumable** — state persists to `~/.claude/adversarial-review-state/`, so you can approve more rounds or answer a question and it continues rather than restarting.
@@ -52,7 +52,7 @@ curl -o ~/.claude/workflows/adversarial-review.js \
 /adversarial-review continue                # approve more rounds from the last checkpoint
 ```
 
-Tuning (optional): pass `effort` (`low`|`medium`|`high`|`xhigh`|`max`) and/or `model` to change the Codex reasoning tier. Default is **`high`** for both PRs and files (drop to `medium`/`low` for a faster, shallower pass on big files).
+Tuning (optional): pass `effort` (`low`|`medium`|`high`|`xhigh`|`max`) and/or `model` to change the Codex run. Defaults are model **`gpt-5.6-sol`** and effort **`high`** for both PRs and files (drop to `medium`/`low` for a faster, shallower pass on big files). Long runs are fine — Codex is launched detached and polled, so there's no 10-minute ceiling.
 
 <details>
 <summary><strong>Setting up Codex</strong> (optional — skip if <code>codex</code> already works)</summary>
@@ -89,7 +89,7 @@ Notes:
 
 ### Hardening / known work
 
-Security and correctness hardening for the review loop is tracked here: **https://github.com/farnell/claude-plugins/issues/2**. (Codex currently ingests untrusted PR content under a prompt-level guard rather than a sandbox, and citations resolve against the working tree rather than the PR head — both are being tightened.)
+Security and correctness hardening for the review loop is tracked here: **https://github.com/farnell/claude-plugins/issues/2**. (Citations now resolve against the PR head via a dedicated worktree; Codex still ingests untrusted PR content under a prompt-level guard rather than a sandbox — that part is still being tightened.)
 
 ---
 

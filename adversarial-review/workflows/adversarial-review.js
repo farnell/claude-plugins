@@ -100,7 +100,7 @@ function codexHarvestCmd(runDir, initial) {
       `echo "@@@CODEX_SESSION_ID@@@$SID@@@END_SID@@@"`,
     )
   }
-  lines.push(`case "$D" in */adv_run.*) rm -rf "$D";; esac`)
+  lines.push(`case "$D" in */adv_run.*) rm -f "$D"/out "$D"/events.json "$D"/stderr.log "$D"/rc && rmdir "$D" 2>/dev/null;; esac`)
   return lines.join('\n')
 }
 function shouldRetryCodex(p) {
@@ -216,17 +216,30 @@ function postCommentScript(target, marker, body) {
     `fi; fi`,
   ].join('\n')
 }
+function linkifyCitation(citation, repoSlug, headOid, okRefs) {
+  if (!repoSlug || !headOid) return String(citation)
+  return String(citation).replace(CITE_RE, (m, file, line) => {
+    const ref = `${file}:${line}`
+    if (file.includes('..') || !okRefs.has(ref)) return m
+    return `[${ref}](https://github.com/${repoSlug}/blob/${headOid}/${file}#L${line})`
+  })
+}
 const SEV_RANK = { critical: 0, high: 1, medium: 2, low: 3 }
 const SEV_BADGE = { critical: '🔴 critical', high: '🟠 high', medium: '🟡 medium', low: '⚪ low' }
-function buildCommentBody(syn, audit, didAgree, rounds, auditedPrHead, modelName) {
+function buildCommentBody(syn, audit, didAgree, rounds, auditedPrHead, modelName, repoSlug, headOid) {
   const sorted = [...(syn.agreedFindings || [])].sort(
     (a, b) => (SEV_RANK[a.severity ?? ''] ?? 9) - (SEV_RANK[b.severity ?? ''] ?? 9)
   )
   const { confirmed, unresolved } = splitFindingsByCitation(sorted, audit && audit.results || undefined)
   const disputed = syn.unresolvedPoints || []
+  const okRefs = new Set(((audit && audit.results) || []).filter((r) => r && r.status === 'ok').map((r) => r.ref))
   const fmt = (f) => {
-    const out = [`- **${SEV_BADGE[f.severity ?? ''] || f.severity || ''}** — ${f.finding}${f.citation ? ` \`${f.citation}\`` : ''}`]
+    const cite = f.citation ? String(f.citation) : ''
+    const linked = cite ? linkifyCitation(cite, repoSlug, headOid, okRefs) : ''
+    const citePart = cite ? (linked !== cite ? ` ${linked}` : ` \`${cite}\``) : ''
+    const out = [`- **${SEV_BADGE[f.severity ?? ''] || f.severity || ''}** — ${f.finding}${citePart}`]
     if (f.actionItem) out.push(`  - ↳ ${f.actionItem}`)
+    if (f.refuterNote) out.push(`  - 🛡️ refuter (low confidence): ${f.refuterNote}`)
     return out
   }
   const L = [COMMENT_MARKER, `## 🔬 Adversarial review — Codex (${modelName}) × Claude`, '']
@@ -383,6 +396,8 @@ if [ -d "$WTBASE" ]; then
 fi
 ${isPR
     ? `echo "TARGET_EXISTS=na"
+REPO_SLUG="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)"
+echo "REPO_SLUG=$REPO_SLUG"
 CID="$(gh pr view ${target} --json headRefOid -q .headRefOid 2>/dev/null)"
 WT=""
 if [ -n "$CID" ]; then
@@ -399,12 +414,13 @@ echo "PR_WORKTREE=$WT"`
     : `test -f "$ROOT/${target}" && echo "TARGET_EXISTS=yes" || echo "TARGET_EXISTS=no"
 CID="$(git hash-object "$ROOT/${target}" 2>/dev/null)"
 [ -n "$CID" ] || CID="$(shasum -a 256 "$ROOT/${target}" 2>/dev/null | awk '{print $1}')"
-echo "PR_WORKTREE="`}
+echo "PR_WORKTREE="
+echo "REPO_SLUG="`}
 echo "CONTENT_ID=$CID"
 \`\`\``,
   {
     label: 'preflight', phase: 'Preflight', agentType: 'general-purpose',
-    schema: { type: 'object', properties: { repoRoot: { type: 'string' }, targetExists: { type: 'string', enum: ['yes', 'no', 'na'] }, contentId: { type: 'string', description: 'the CONTENT_ID value verbatim (empty string if it was empty)' }, prWorktree: { type: 'string', description: 'the PR_WORKTREE value verbatim (empty string if it was empty or absent)' } }, required: ['repoRoot', 'targetExists', 'contentId', 'prWorktree'] },
+    schema: { type: 'object', properties: { repoRoot: { type: 'string' }, targetExists: { type: 'string', enum: ['yes', 'no', 'na'] }, contentId: { type: 'string', description: 'the CONTENT_ID value verbatim (empty string if it was empty)' }, prWorktree: { type: 'string', description: 'the PR_WORKTREE value verbatim (empty string if it was empty or absent)' }, repoSlug: { type: 'string', description: 'the REPO_SLUG value verbatim (empty string if it was empty or absent)' } }, required: ['repoRoot', 'targetExists', 'contentId', 'prWorktree', 'repoSlug'] },
   }
 )
 const repoRoot = preflight.repoRoot || 'unknown-repo'
@@ -427,6 +443,12 @@ const prWorktree = /^[A-Za-z0-9._/-]+$/.test(prWorktreeRaw) && prWorktreeRaw.inc
 if (isPR && !prWorktree) {
   log(`⚠️ PR-head isolation unavailable (worktree could not be created) — Codex context reads and the citation audit run against the CURRENT checkout, so file:line citations may falsely resolve or falsely fail if the PR branch is not checked out.`)
 }
+
+// Repo slug (owner/repo, PR targets only) for GitHub permalinks in the summary
+// comment. Untrusted transport → strict charset validation; anything off-shape
+// degrades to '' = no permalinks (citations render as plain backticked text).
+const repoSlugRaw = isPR && typeof preflight.repoSlug === 'string' ? preflight.repoSlug.trim() : ''
+const repoSlug = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoSlugRaw) ? repoSlugRaw : ''
 
 // ─── Codex invocation: launch → poll → harvest ───────────────────────────────
 // The pure command builders (codexLaunchCmd / codexPollCmd / codexHarvestCmd)
@@ -507,7 +529,11 @@ async function runCodexAgent(promptShq, sid, label, phaseName) {
     ),
     { label, phase: phaseName, agentType: 'general-purpose' }
   )
-  return { ...parseCodex(raw), raw }
+  // agent() can return null (user skip / terminal API error) — parseCodex
+  // would throw on a non-string. A null result reads as a failed codex run
+  // (rc null, ok false) and flows into the existing retry/codex_failed paths.
+  const s = typeof raw === 'string' ? raw : ''
+  return { ...parseCodex(s), raw: s }
 }
 
 // ─── Disk persistence (agent-mediated — the workflow runtime has no fs) ───────
@@ -1096,7 +1122,7 @@ async function auditCitations(findings) {
   // resolve via find so the audit doesn't cry wolf on legitimate citations.
   const checks = refs.map((r) => {
     const i = r.lastIndexOf(':'); const file = r.slice(0, i); const line = r.slice(i + 1)
-    return `f=${shq(file)}; ln=${line}; case "$f" in */*) p="$ROOT/$f";; *) p="$(find "$ROOT" -name "$f" -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null | head -1)";; esac; if [ -n "$p" ] && [ -f "$p" ]; then tot=$(wc -l < "$p"); if [ "$ln" -ge 1 ] && [ "$ln" -le "$tot" ]; then echo ${shq('OK ' + r)}; else echo ${shq('BADLINE ' + r)}" ($tot lines)"; fi; else echo ${shq('NOFILE ' + r)}; fi`
+    return `f=${shq(file)}; ln=${line}; case "$f" in */*) p="$ROOT/$f";; *) p="$(find "$ROOT" -name "$f" -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null | head -1)";; esac; if [ -n "$p" ] && [ -f "$p" ]; then tot=$(wc -l < "$p"); if [ "$ln" -ge 1 ] && [ "$ln" -le "$tot" ]; then echo ${shq('OK ' + r)}" | $(sed -n "\${ln}p" "$p" | cut -c1-200)"; else echo ${shq('BADLINE ' + r)}" ($tot lines)"; fi; else echo ${shq('NOFILE ' + r)}; fi`
   }).join('\n')
   const res = await agent(
     `Validate that each file:line citation from an adversarial review actually resolves against the repository. Run exactly this and report every output line verbatim:
@@ -1106,10 +1132,10 @@ ${prWorktree ? `ROOT=${shq(prWorktree)}` : `ROOT="$(git rev-parse --show-topleve
 ${checks}
 \`\`\`
 
-Each line is "OK <ref>", "BADLINE <ref> (N lines)" (line past EOF), or "NOFILE <ref>" (file missing). Map each to results[] with status ok|badline|nofile.`,
+Each line is "OK <ref> | <first 200 chars of the cited line>", "BADLINE <ref> (N lines)" (line past EOF), or "NOFILE <ref>" (file missing). Map each to results[] with status ok|badline|nofile. For OK lines, put the text after the first " | " separator into that result's detail field VERBATIM (it is the cited line's actual content, so a human can eyeball whether it plausibly supports the finding); for BADLINE put the parenthesized line count in detail.`,
     {
       label: 'citation-audit', phase: 'Synthesis', agentType: 'general-purpose',
-      schema: { type: 'object', properties: { results: { type: 'array', items: { type: 'object', properties: { ref: { type: 'string' }, status: { type: 'string', enum: ['ok', 'badline', 'nofile'] }, detail: { type: 'string' } }, required: ['ref', 'status'] } } }, required: ['results'] },
+      schema: { type: 'object', properties: { results: { type: 'array', items: { type: 'object', properties: { ref: { type: 'string' }, status: { type: 'string', enum: ['ok', 'badline', 'nofile'] }, detail: { type: 'string', description: 'for ok: the cited line\'s text (after " | "); for badline: the line count' } }, required: ['ref', 'status'] } } }, required: ['results'] },
     }
   )
   const results = res.results || []
@@ -1172,7 +1198,9 @@ if (postComment && isPR) {
   // Strictly non-fatal: the review result is already computed, so a throw in
   // buildCommentBody OR a rejected agent() must never abort before we return it.
   try {
-    commentResult = await postSummaryComment(buildCommentBody(synthesis, citationAudit, agreed, critiqueRounds, !!prWorktree, CODEX_MODEL))
+    // repoSlug + head oid (contentId holds headRefOid for PR targets) turn
+    // audit-confirmed file:line refs into clickable GitHub permalinks.
+    commentResult = await postSummaryComment(buildCommentBody(synthesis, citationAudit, agreed, critiqueRounds, !!prWorktree, CODEX_MODEL, repoSlug, isPR ? contentId : ''))
   } catch (e) {
     commentResult = { posted: false, action: 'failed', reason: `comment step threw: ${e && e.message ? e.message : e}` }
   }
