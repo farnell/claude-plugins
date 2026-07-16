@@ -404,7 +404,8 @@ if [ -n "$CID" ]; then
   WT="$WTBASE/pr-${target}-$(printf '%s' "$ROOT" | shasum | cut -c1-8)"
   mkdir -p "$WTBASE" 2>/dev/null
   if git -C "$ROOT" fetch -q origin "pull/${target}/head" 2>/dev/null; then
-    git -C "$ROOT" worktree add -f "$WT" FETCH_HEAD 2>/dev/null || git -C "$WT" checkout -q -f FETCH_HEAD 2>/dev/null || git -C "$WT" reset -q --hard FETCH_HEAD 2>/dev/null || WT=""
+    OID="$(git -C "$ROOT" rev-parse FETCH_HEAD 2>/dev/null)"
+    [ -n "$OID" ] && { git -C "$ROOT" worktree add -f "$WT" "$OID" 2>/dev/null || git -C "$WT" reset -q --hard "$OID" 2>/dev/null || WT=""; } || WT=""
   else
     WT=""
   fi
@@ -439,7 +440,7 @@ const STATE_PATH = `${STATE_DIR}/${makeStateKey(target, isPR, repoRoot)}.json`
 // accept it only when it has exactly the shape the preflight bash constructs;
 // anything else degrades to '' = today's checkout-relative behaviour.
 const prWorktreeRaw = isPR && typeof preflight.prWorktree === 'string' ? preflight.prWorktree.trim() : ''
-const prWorktree = /^[A-Za-z0-9._/-]+$/.test(prWorktreeRaw) && prWorktreeRaw.includes('/.claude/adversarial-review-state/worktrees/pr-') ? prWorktreeRaw : ''
+const prWorktree = /^[A-Za-z0-9._/-]+$/.test(prWorktreeRaw) && !prWorktreeRaw.includes('..') && prWorktreeRaw.includes('/.claude/adversarial-review-state/worktrees/pr-') ? prWorktreeRaw : ''
 if (isPR && !prWorktree) {
   log(`⚠️ PR-head isolation unavailable (worktree could not be created) — Codex context reads and the citation audit run against the CURRENT checkout, so file:line citations may falsely resolve or falsely fail if the PR branch is not checked out.`)
 }
@@ -1200,7 +1201,10 @@ if (postComment && isPR) {
   try {
     // repoSlug + head oid (contentId holds headRefOid for PR targets) turn
     // audit-confirmed file:line refs into clickable GitHub permalinks.
-    commentResult = await postSummaryComment(buildCommentBody(synthesis, citationAudit, agreed, critiqueRounds, !!prWorktree, CODEX_MODEL, repoSlug, isPR ? contentId : ''))
+    // Permalinks only when the audit actually ran against the PR head — in the
+    // checkout-relative fallback an okRef verified locally could permalink to
+    // an unrelated line at the PR-head oid. headOid='' suppresses linkify.
+    commentResult = await postSummaryComment(buildCommentBody(synthesis, citationAudit, agreed, critiqueRounds, !!prWorktree, CODEX_MODEL, repoSlug, prWorktree ? contentId : ''))
   } catch (e) {
     commentResult = { posted: false, action: 'failed', reason: `comment step threw: ${e && e.message ? e.message : e}` }
   }
