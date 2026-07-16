@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import * as core from '../core'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -195,6 +197,156 @@ The @@@CODEX_SESSION_ID@@@ marker handling looks fragile.
     const r = core.parseCodex('@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nprose mentions @@@CODEX_STDERR@@@ without a fence')
     expect(r.stderr).toBe('')
     expect(r.content).toContain('@@@CODEX_STDERR@@@')
+  })
+})
+
+// ─── codexLaunchCmd / codexPollCmd / codexHarvestCmd (launch→poll→harvest) ───
+describe('codexLaunchCmd', () => {
+  const FLAGS = '-c model="gpt-5.5" -c model_reasoning_effort="high"'
+  const SID = '019ee36e-742e-7272-9252-de4a771df7b2'
+
+  it('initial: creates a per-run temp dir, echoes it self-delimiting, and launches codex detached', () => {
+    const s = core.codexLaunchCmd(FLAGS, core.shq('review this'), null, '')
+    expect(s).toContain('D="$(mktemp -d -t adv_run.XXXXXX)"')
+    expect(s).toContain('echo "@@@CODEX_RUNDIR@@@$D@@@END_RUNDIR@@@"')
+    expect(s).toContain(`codex exec --json ${FLAGS} --output-last-message "$1/out" "$2"`)
+    expect(s).toContain('nohup sh -c')
+    expect(s).toContain('> /dev/null 2>&1 &')
+    expect(s).toContain('disown')
+    expect(s).toContain('ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"')
+    // events + stderr are captured to files for the later harvest
+    expect(s).toContain('> "$1/events.json" 2> "$1/stderr.log"')
+  })
+  it('the rc write is the LAST step of the detached wrapper — the completion signal', () => {
+    const s = core.codexLaunchCmd(FLAGS, core.shq('p'), null, '')
+    // rc is written after codex exits, inside the same sh -c, as its final command
+    expect(s).toContain(`; echo $? > "$1/rc"' sh "$D"`)
+    expect(s.indexOf('--output-last-message')).toBeLessThan(s.indexOf('echo $? > "$1/rc"'))
+  })
+  it('the prompt rides as a positional arg ($2), shq-quoted — never nested in the sh -c body', () => {
+    const s = core.codexLaunchCmd(FLAGS, core.shq("it's a prompt"), null, '')
+    expect(s).toContain(` sh "$D" 'it'\\''s a prompt' > /dev/null 2>&1 &`)
+  })
+  it('resume: codex exec resume <sid>, same detached shape', () => {
+    const s = core.codexLaunchCmd(FLAGS, core.shq('p'), SID, '')
+    expect(s).toContain(`codex exec resume ${SID} --json ${FLAGS} --output-last-message "$1/out" "$2"`)
+    expect(s).toContain('mktemp -d -t adv_run.XXXXXX')
+  })
+  it('root override cds into the given root (shq-quoted) instead of deriving it in-shell', () => {
+    const wt = '/home/u/.claude/adversarial-review-state/worktrees/pr-9-abc12345'
+    const s = core.codexLaunchCmd(FLAGS, core.shq('p'), null, wt)
+    expect(s).toContain(`ROOT='${wt}'`)
+    expect(s).not.toContain('git rev-parse --show-toplevel')
+    expect(s).toContain('cd "$ROOT" && nohup')
+  })
+})
+
+describe('codexPollCmd', () => {
+  it('probes the rc completion file', () => {
+    expect(core.codexPollCmd('/tmp/adv_run.abc123')).toBe(`D='/tmp/adv_run.abc123'\ntest -f "$D/rc" && echo DONE || echo RUNNING`)
+  })
+})
+
+describe('codexHarvestCmd', () => {
+  it('emits the exact marker grammar parseCodex expects (initial variant)', () => {
+    const s = core.codexHarvestCmd('/tmp/adv_run.abc', true)
+    expect(s).toContain(`D='/tmp/adv_run.abc'`)
+    expect(s).toContain('echo "@@@CODEX_RC@@@${RC:-1}"')
+    expect(s).toContain('echo "@@@CODEX_OUTPUT@@@"')
+    expect(s).toContain('[ "$RC" = "0" ] && cat "$D/out"')
+    expect(s).toContain(`printf '@@@CODEX_STDERR@@@%s@@@END_STDERR@@@\\n' "$(tail -c 2000 "$D/stderr.log")"`)
+    expect(s).toContain('echo "@@@CODEX_SESSION_ID@@@$SID@@@END_SID@@@"')
+  })
+  it('the resume variant omits the session-id capture entirely', () => {
+    const s = core.codexHarvestCmd('/tmp/adv_run.abc', false)
+    expect(s).not.toContain('CODEX_SESSION_ID')
+    expect(s).not.toContain('thread_id')
+  })
+  it('the stderr tail is gated on failure', () => {
+    expect(core.codexHarvestCmd('/t/adv_run.x', true)).toContain('if [ "$RC" != "0" ] && [ -s "$D/stderr.log" ]; then')
+  })
+  it('rm -rf is guarded by the mktemp prefix pattern and is the ONLY rm in the script', () => {
+    const s = core.codexHarvestCmd('/tmp/adv_run.abc', true)
+    expect(s).toContain('case "$D" in */adv_run.*) rm -rf "$D";; esac')
+    expect(s.match(/rm /g)).toHaveLength(1)
+  })
+  it('every marker is emitted BEFORE the run dir is removed', () => {
+    const s = core.codexHarvestCmd('/tmp/adv_run.abc', true)
+    for (const marker of ['@@@CODEX_RC@@@', '@@@CODEX_OUTPUT@@@', '@@@END_STDERR@@@', '@@@END_SID@@@']) {
+      expect(s.indexOf(marker)).toBeLessThan(s.indexOf('rm -rf'))
+    }
+  })
+
+  // Executed round-trips: run the REAL harvest bash over a synthesized run dir
+  // and feed its stdout to parseCodex — proves the launch/poll/harvest protocol
+  // preserves the exact marker grammar the parser expects.
+  it('executed harvest of a SUCCESSFUL initial run round-trips through parseCodex (and removes the dir)', () => {
+    const d = mkdtempSync(join(tmpdir(), 'adv_run.'))
+    writeFileSync(join(d, 'rc'), '0\n')
+    writeFileSync(join(d, 'out'), 'the review body\n')
+    writeFileSync(join(d, 'events.json'), '{"type":"thread.started","thread_id":"019ee36e-742e-7272-9252-de4a771df7b2"}\n')
+    writeFileSync(join(d, 'stderr.log'), '')
+    const stdout = execFileSync('bash', ['-c', core.codexHarvestCmd(d, true)], { encoding: 'utf8' })
+    const p = core.parseCodex(stdout)
+    expect(p.ok).toBe(true)
+    expect(p.rc).toBe(0)
+    expect(p.content).toBe('the review body')
+    expect(p.sessionId).toBe('019ee36e-742e-7272-9252-de4a771df7b2')
+    expect(p.stderr).toBe('')
+    expect(existsSync(d)).toBe(false) // run dir cleaned up
+  })
+  it('executed harvest of a FAILED run round-trips through parseCodex with the stderr tail', () => {
+    const d = mkdtempSync(join(tmpdir(), 'adv_run.'))
+    writeFileSync(join(d, 'rc'), '1\n')
+    writeFileSync(join(d, 'stderr.log'), 'codex: auth token expired\n')
+    const stdout = execFileSync('bash', ['-c', core.codexHarvestCmd(d, true)], { encoding: 'utf8' })
+    const p = core.parseCodex(stdout)
+    expect(p.ok).toBe(false)
+    expect(p.rc).toBe(1)
+    expect(p.content).toBe('')
+    expect(p.stderr).toBe('codex: auth token expired')
+    expect(p.sessionId).toBeNull()
+    expect(existsSync(d)).toBe(false)
+  })
+  it('executed harvest with a MISSING rc file reports rc 1 (never a false success)', () => {
+    const d = mkdtempSync(join(tmpdir(), 'adv_run.'))
+    writeFileSync(join(d, 'out'), 'never shown\n')
+    const stdout = execFileSync('bash', ['-c', core.codexHarvestCmd(d, false)], { encoding: 'utf8' })
+    const p = core.parseCodex(stdout)
+    expect(p.rc).toBe(1)
+    expect(p.ok).toBe(false)
+    expect(p.content).toBe('')
+  })
+  it('executed harvest NEVER removes a dir that does not match the adv_run. prefix', () => {
+    const d = mkdtempSync(join(tmpdir(), 'other.'))
+    try {
+      writeFileSync(join(d, 'rc'), '0\n')
+      writeFileSync(join(d, 'out'), 'x\n')
+      writeFileSync(join(d, 'events.json'), '')
+      execFileSync('bash', ['-c', core.codexHarvestCmd(d, true)], { encoding: 'utf8' })
+      expect(existsSync(d)).toBe(true) // rm guard held
+    } finally {
+      rmSync(d, { recursive: true, force: true })
+    }
+  })
+})
+
+// ─── shouldRetryCodex (one auto-retry, except the poll-budget timeout) ────────
+describe('shouldRetryCodex', () => {
+  it('never retries a success', () => {
+    expect(core.shouldRetryCodex({ ok: true, rc: 0 })).toBe(false)
+  })
+  it('retries a nonzero exit', () => {
+    expect(core.shouldRetryCodex({ ok: false, rc: 1 })).toBe(true)
+  })
+  it('retries rc 0 with empty content (ok=false)', () => {
+    expect(core.shouldRetryCodex({ ok: false, rc: 0 })).toBe(true)
+  })
+  it('retries a missing rc marker (relay failure)', () => {
+    expect(core.shouldRetryCodex({ ok: false, rc: null })).toBe(true)
+  })
+  it('does NOT retry the poll-budget timeout (rc 124) — a second hour-long grind will not fix "too large"', () => {
+    expect(core.shouldRetryCodex({ ok: false, rc: 124 })).toBe(false)
   })
 })
 
@@ -447,6 +599,60 @@ describe('postCommentScript', () => {
   })
 })
 
+// ─── buildCommentBody (summary comment renderer + audit-locus caveat) ─────────
+describe('buildCommentBody', () => {
+  const syn: core.SynthesisLike = {
+    summary: 'One-line summary.',
+    agreedFindings: [
+      { finding: 'F-ok', severity: 'high', actionItem: 'fix it', citation: 'a.ts:5' },
+      { finding: 'F-bad', severity: 'critical', actionItem: 'check it', citation: 'b.ts:9' },
+    ],
+    unresolvedPoints: [{ point: 'P1', codexView: 'cv', claudeView: 'clv' }],
+    prioritizedActionItems: ['do x first'],
+  }
+  const audit: core.CitationAuditLike = {
+    checked: 2, unresolved: 1, badRefs: ['b.ts:9'],
+    results: [{ ref: 'a.ts:5', status: 'ok' }, { ref: 'b.ts:9', status: 'nofile' }],
+  }
+
+  it('carries the marker, status counts, and fail-closed confirmed/unverified buckets', () => {
+    const body = core.buildCommentBody(syn, audit, true, 2, false)
+    expect(body).toContain(core.COMMENT_MARKER)
+    expect(body).toContain('✅ Full agreement after 2 round(s)')
+    expect(body).toContain('**1** confirmed · **1** unverified · **1** disputed')
+    // confirmed section lists the resolving finding; unresolved bucket the other
+    expect(body.indexOf('F-ok')).toBeGreaterThan(body.indexOf('### ✅ Confirmed findings'))
+    expect(body.indexOf('F-bad')).toBeGreaterThan(body.indexOf('citation not verified'))
+    expect(body).toContain('- **P1**')
+    expect(body).toContain('1. do x first')
+  })
+  it('audit caveat is checkout-relative when auditedPrHead=false (keeps the not-on-this-branch excuse)', () => {
+    const body = core.buildCommentBody(syn, audit, true, 2, false)
+    expect(body).toContain('did not resolve against the current checkout')
+    expect(body).toContain('not on this branch')
+    expect(body).not.toContain('PR head')
+  })
+  it('audit caveat says PR head when auditedPrHead=true — the branch-mismatch excuse disappears', () => {
+    const body = core.buildCommentBody(syn, audit, true, 2, true)
+    expect(body).toContain('did not resolve against the PR head')
+    expect(body).not.toContain('not on this branch')
+    expect(body).not.toContain('current checkout')
+  })
+  it('no audit caveat when everything resolved (either locus)', () => {
+    const clean: core.CitationAuditLike = { checked: 1, unresolved: 0, badRefs: [], results: [{ ref: 'a.ts:5', status: 'ok' }] }
+    for (const flag of [true, false]) {
+      const body = core.buildCommentBody(syn, clean, false, 3, flag)
+      expect(body).toContain('⚠️ 3 round(s), no full agreement')
+      expect(body).not.toContain('did not resolve')
+    }
+  })
+  it('tolerates an empty synthesis and a missing audit (everything unverified, no caveat)', () => {
+    const body = core.buildCommentBody({}, undefined, false, 0, false)
+    expect(body).toContain('_None._')
+    expect(body).toContain('**0** confirmed · **0** unverified · **0** disputed')
+  })
+})
+
 // ─── DRIFT GUARD ─────────────────────────────────────────────────────────────
 // The workflow inlines copies of these helpers (it cannot import). Extract that
 // block and assert behavioural parity with the canonical core across shared
@@ -461,7 +667,7 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
 
   it('inline helpers behave identically to core for every vector', () => {
     const inline: any = new Function(
-      `${block}\n;return { parseArgs, validateTarget, shortHash, makeStateKey, shq, parseCodex, agreementProblem, buildCritique, decideResumeAction, checkStaleness, COMMENT_MARKER, heredocDelim, splitFindingsByCitation, summarizeAudit, postCommentScript };`
+      `${block}\n;return { parseArgs, validateTarget, shortHash, makeStateKey, shq, parseCodex, codexLaunchCmd, codexPollCmd, codexHarvestCmd, shouldRetryCodex, agreementProblem, buildCritique, decideResumeAction, checkStaleness, COMMENT_MARKER, heredocDelim, splitFindingsByCitation, summarizeAudit, postCommentScript, buildCommentBody };`
     )()
 
     const argVectors = [{ target: '249', maxRounds: 3 }, '{"target":"249","resume":true}', 'docs/x.md', '{bad', undefined]
@@ -496,6 +702,27 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
       '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nprose mentions @@@CODEX_STDERR@@@ without a fence',
     ]
     for (const v of codexVectors) expect(inline.parseCodex(v)).toEqual(core.parseCodex(v))
+
+    // Launch/poll/harvest builders + retry policy
+    const FLAGS = '-c model="gpt-5.5" -c model_reasoning_effort="high"'
+    const RESUME_SID = '019ee36e-742e-7272-9252-de4a771df7b2'
+    const launchVectors: Array<[string, string | null, string]> = [
+      [core.shq('review this'), null, ''],
+      [core.shq("it's a prompt"), RESUME_SID, ''],
+      [core.shq('p'), null, '/home/u/.claude/adversarial-review-state/worktrees/pr-9-abc12345'],
+      [core.shq('p'), RESUME_SID, '/home/u/.claude/adversarial-review-state/worktrees/pr-9-abc12345'],
+    ]
+    for (const [p, s, r] of launchVectors) expect(inline.codexLaunchCmd(FLAGS, p, s, r)).toBe(core.codexLaunchCmd(FLAGS, p, s, r))
+    for (const d of ['/tmp/adv_run.abc123', '__RUNDIR__']) {
+      expect(inline.codexPollCmd(d)).toBe(core.codexPollCmd(d))
+      expect(inline.codexHarvestCmd(d, true)).toBe(core.codexHarvestCmd(d, true))
+      expect(inline.codexHarvestCmd(d, false)).toBe(core.codexHarvestCmd(d, false))
+    }
+    const retryVectors = [
+      { ok: true, rc: 0 }, { ok: false, rc: 1 }, { ok: false, rc: 0 },
+      { ok: false, rc: null }, { ok: false, rc: 124 },
+    ]
+    for (const v of retryVectors) expect(inline.shouldRetryCodex(v)).toBe(core.shouldRetryCodex(v))
 
     const agreeVectors = [
       { verifiedFindings: [{ codexClaim: 'x', verified: true, evidence: 'f:1' }], missedFindings: [] },
@@ -558,5 +785,28 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
     for (const [r, a] of auditVectors) expect(inline.summarizeAudit(r, a)).toEqual(core.summarizeAudit(r, a))
 
     for (const b of bodyVectors) expect(inline.postCommentScript('256', inline.COMMENT_MARKER, b)).toBe(core.postCommentScript('256', core.COMMENT_MARKER, b))
+
+    // buildCommentBody (severity sort, fail-closed buckets, audit-locus caveat)
+    const synV = {
+      summary: 'sum\nmary',
+      agreedFindings: [
+        { finding: 'F-ok', severity: 'high', actionItem: 'fix', citation: 'a.ts:5' },
+        { finding: 'F-bad', severity: 'critical', actionItem: 'check', citation: 'b.ts:9' },
+        { finding: 'F-prose', severity: 'weird', citation: 'no ref here' },
+      ],
+      unresolvedPoints: [{ point: 'P', codexView: 'cv', claudeView: 'clv' }],
+      prioritizedActionItems: ['do x'],
+    }
+    const auditV = {
+      checked: 2, unresolved: 1, badRefs: ['b.ts:9'],
+      results: [{ ref: 'a.ts:5', status: 'ok' }, { ref: 'b.ts:9', status: 'nofile' }],
+    }
+    const commentVectors: Array<[any, any, boolean, number, boolean]> = [
+      [synV, auditV, true, 2, false],
+      [synV, auditV, true, 2, true],
+      [synV, { checked: 1, unresolved: 0, badRefs: [], results: [{ ref: 'a.ts:5', status: 'ok' }] }, false, 3, true],
+      [{}, undefined, false, 0, false],
+    ]
+    for (const [sy, au, ag, ro, ph] of commentVectors) expect(inline.buildCommentBody(sy, au, ag, ro, ph)).toBe(core.buildCommentBody(sy, au, ag, ro, ph))
   })
 })

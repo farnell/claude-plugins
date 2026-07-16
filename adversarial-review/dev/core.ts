@@ -132,6 +132,87 @@ export function parseCodex(raw: string): CodexResult {
   return { content, sessionId, rc, ok: rc === 0 && content.length > 0, stderr }
 }
 
+// ─── Codex launch / poll / harvest command builders ─────────────────────────
+// The codex run used to be ONE foreground bash call inside the codex-runner
+// subagent, which capped every review at the Bash tool's 10-minute timeout
+// (a long high-effort run died mid-flight as codex_failed). The run is now
+// split into three short commands the subagent issues as SEPARATE Bash calls:
+//
+//   launch  → mktemp a per-run dir (echoed self-delimiting as
+//             @@@CODEX_RUNDIR@@@<dir>@@@END_RUNDIR@@@), start codex detached
+//             (nohup … & disown) and return immediately. The detached wrapper
+//             writes codex's exit code to $D/rc as its LAST step, so the rc
+//             file's existence IS the completion signal.
+//   poll    → cheap existence probe of $D/rc → DONE / RUNNING.
+//   harvest → emit EXACTLY the marker grammar parseCodex expects
+//             (@@@CODEX_RC@@@ / @@@CODEX_OUTPUT@@@ / fenced stderr / fenced
+//             session id), then remove the run dir (prefix-guarded rm).
+//
+// All three are pure string builders so the protocol is unit-testable.
+
+/** Launch codex detached. `flags` is the pre-validated model/effort flag
+ *  string; `promptShq` an shq()-quoted prompt. `resumeSid` null → initial
+ *  review (`codex exec`, with the `--json` event stream captured to
+ *  $D/events.json for the harvest's session-id grep); a validated uuid →
+ *  `codex exec resume <sid>`. `rootOverride` '' → derive the repo root
+ *  in-shell (git rev-parse, today's behaviour); non-empty (e.g. the PR-head
+ *  worktree) → cd there instead. The prompt travels into the detached shell
+ *  as a POSITIONAL ARG ($2) — never nested inside the single-quoted `sh -c`
+ *  body, so the shq quoting survives intact. */
+export function codexLaunchCmd(flags: string, promptShq: string, resumeSid: string | null, rootOverride: string): string {
+  const exec = resumeSid ? `codex exec resume ${resumeSid} --json ${flags}` : `codex exec --json ${flags}`
+  return [
+    rootOverride ? `ROOT=${shq(rootOverride)}` : `ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`,
+    `D="$(mktemp -d -t adv_run.XXXXXX)"`,
+    `echo "@@@CODEX_RUNDIR@@@$D@@@END_RUNDIR@@@"`,
+    `cd "$ROOT" && nohup sh -c '${exec} --output-last-message "$1/out" "$2" > "$1/events.json" 2> "$1/stderr.log"; echo $? > "$1/rc"' sh "$D" ${promptShq} > /dev/null 2>&1 &`,
+    `disown 2>/dev/null || true`,
+  ].join('\n')
+}
+
+/** Completion probe: the rc file is written LAST by the launch wrapper, so its
+ *  existence is the completion signal. The runner subagent may wrap this in a
+ *  bounded sleep loop — the bare probe is the permission-safe fallback. */
+export function codexPollCmd(runDir: string): string {
+  return `D=${shq(runDir)}\ntest -f "$D/rc" && echo DONE || echo RUNNING`
+}
+
+/** Harvest a finished run: emits EXACTLY the marker protocol parseCodex
+ *  expects — @@@CODEX_RC@@@<rc> (missing/unreadable rc file reads as 1),
+ *  @@@CODEX_OUTPUT@@@ + the last-message file (success only), a fenced
+ *  @@@CODEX_STDERR@@@ 2000-byte tail on failure, and (initial only) the
+ *  session id grepped from the --json event stream, fenced self-delimiting on
+ *  one line. Ends by removing the run dir, guarded so only a path matching
+ *  the mktemp template (basename starts with `adv_run.`) is ever rm -rf'd. */
+export function codexHarvestCmd(runDir: string, initial: boolean): string {
+  const lines = [
+    `D=${shq(runDir)}`,
+    `RC="$(cat "$D/rc" 2>/dev/null)"`,
+    'echo "@@@CODEX_RC@@@${RC:-1}"',
+    `echo "@@@CODEX_OUTPUT@@@"`,
+    `[ "$RC" = "0" ] && cat "$D/out"`,
+    `echo`,
+    `if [ "$RC" != "0" ] && [ -s "$D/stderr.log" ]; then printf '@@@CODEX_STDERR@@@%s@@@END_STDERR@@@\\n' "$(tail -c 2000 "$D/stderr.log")"; fi`,
+  ]
+  if (initial) {
+    lines.push(
+      `SID=""; [ "$RC" = "0" ] && SID="$(grep -o '"thread_id":"[0-9a-f-]\\{36\\}"' "$D/events.json" | head -1 | grep -o '[0-9a-f-]\\{36\\}' | head -1)"`,
+      `echo "@@@CODEX_SESSION_ID@@@$SID@@@END_SID@@@"`,
+    )
+  }
+  lines.push(`case "$D" in */adv_run.*) rm -rf "$D";; esac`)
+  return lines.join('\n')
+}
+
+/** ONE automatic retry policy for a failed codex call: retry only when it
+ *  plausibly helps — any failure (non-zero rc, missing rc marker, or rc 0
+ *  with empty content) EXCEPT the poll-budget timeout (rc 124), where a
+ *  second hour-long grind would hit the same wall; the fix there is a lower
+ *  reasoning effort, surfaced in the codex_failed message instead. */
+export function shouldRetryCodex(p: { ok: boolean; rc: number | null }): boolean {
+  return !p.ok && p.rc !== 124
+}
+
 export interface CritiqueResult {
   status?: string
   verifiedFindings?: Array<{ codexClaim: string; verified: boolean; evidence: string }>
@@ -368,4 +449,85 @@ export function postCommentScript(target: string, marker: string, body: string):
     `echo "@@@ADV_COMMENT_RC@@@$RC"; echo "@@@ADV_COMMENT_ACTION@@@$ACTION"; echo "@@@ADV_COMMENT_URL@@@$URL"`,
     `fi; fi`,
   ].join('\n')
+}
+
+// ─── Summary-comment renderer ────────────────────────────────────────────────
+const SEV_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 }
+const SEV_BADGE: Record<string, string> = { critical: '🔴 critical', high: '🟠 high', medium: '🟡 medium', low: '⚪ low' }
+
+export interface SynthesisLike {
+  summary?: string
+  agreedFindings?: Array<{ finding?: string; severity?: string; actionItem?: string; citation?: string }>
+  unresolvedPoints?: Array<{ point?: string; codexView?: string; claudeView?: string }>
+  prioritizedActionItems?: string[]
+}
+export interface CitationAuditLike { checked: number; unresolved: number; badRefs?: string[]; results?: AuditResult[] }
+
+/** Render the synthesized review as the PR summary comment body. Findings are
+ *  severity-sorted, then FAIL-CLOSED bucketed by splitFindingsByCitation into
+ *  confirmed vs citation-unverified. `auditedPrHead` records WHERE the citation
+ *  audit ran: true = against a materialized PR-head worktree, so an unresolved
+ *  ref cannot be excused as "not on this branch"; false = against the user's
+ *  current checkout (the fallback when no worktree could be created), where a
+ *  ref may fail to resolve simply because the PR branch is not checked out. */
+export function buildCommentBody(syn: SynthesisLike, audit: CitationAuditLike | undefined | null, didAgree: boolean, rounds: number, auditedPrHead: boolean): string {
+  const sorted = [...(syn.agreedFindings || [])].sort(
+    (a, b) => (SEV_RANK[a.severity ?? ''] ?? 9) - (SEV_RANK[b.severity ?? ''] ?? 9)
+  )
+  // A finding whose cited file:line did NOT resolve must not be sold as
+  // "confirmed" (the footer defines confirmed = citation resolves) — split it
+  // into its own re-check bucket so the comment never contradicts itself.
+  const { confirmed, unresolved } = splitFindingsByCitation(sorted, audit && audit.results || undefined)
+  const disputed = syn.unresolvedPoints || []
+  const fmt = (f: { finding?: string; severity?: string; actionItem?: string; citation?: string }) => {
+    const out = [`- **${SEV_BADGE[f.severity ?? ''] || f.severity || ''}** — ${f.finding}${f.citation ? ` \`${f.citation}\`` : ''}`]
+    if (f.actionItem) out.push(`  - ↳ ${f.actionItem}`)
+    return out
+  }
+  const L = [COMMENT_MARKER, '## 🔬 Adversarial review — Codex (gpt-5.5) × Claude', '']
+  if (syn.summary) L.push(`> ${String(syn.summary).replace(/\s*\n+\s*/g, ' ')}`, '')
+  const status = didAgree
+    ? `✅ Full agreement after ${rounds} round(s)`
+    : `⚠️ ${rounds} round(s), no full agreement`
+  L.push(`**Status:** ${status} · **${confirmed.length}** confirmed · **${unresolved.length}** unverified · **${disputed.length}** disputed`, '')
+
+  L.push('### ✅ Confirmed findings')
+  if (!confirmed.length) L.push('_None._')
+  else for (const f of confirmed) L.push(...fmt(f))
+  L.push('')
+
+  if (unresolved.length) {
+    L.push('### ⚠️ Agreed, but citation not verified against source — re-check before acting')
+    for (const f of unresolved) L.push(...fmt(f))
+    L.push('')
+  }
+
+  L.push('### ⚖️ Disputed — needs human judgement')
+  if (!disputed.length) L.push('_None._')
+  else for (const d of disputed) {
+    L.push(`- **${d.point}**`)
+    if (d.codexView) L.push(`  - **Codex:** ${d.codexView}`)
+    if (d.claudeView) L.push(`  - **Claude:** ${d.claudeView}`)
+  }
+  L.push('')
+
+  const actions = syn.prioritizedActionItems || []
+  if (actions.length) {
+    L.push('### 📋 Prioritized actions')
+    actions.forEach((a, i) => L.push(`${i + 1}. ${a}`))
+    L.push('')
+  }
+
+  if (audit && audit.unresolved > 0) {
+    const bad = (audit.badRefs || []).join(', ')
+    L.push(auditedPrHead
+      // The audit ran against the PR head itself — an unresolved ref is
+      // genuinely stale/hallucinated/unaudited, not a branch mismatch.
+      ? `> ⚠️ ${audit.unresolved}/${audit.checked} cited \`file:line\` refs did not resolve against the PR head (stale, hallucinated, or not audited): ${bad}.`
+      // Checkout-relative fallback — the ref may simply not be on this branch.
+      : `> ⚠️ ${audit.unresolved}/${audit.checked} cited \`file:line\` refs did not resolve against the current checkout (stale, hallucinated, not audited, or not on this branch): ${bad}.`, '')
+  }
+
+  L.push('---', '<sub>🤖 Posted by `/adversarial-review`. Confirmed = both models agree AND every cited file:line was checked and resolves; “unverified” = agreed but the citation is missing, isn’t a file:line, or didn’t resolve — re-check manually; disputed = stable disagreement for a human.</sub>')
+  return L.join('\n')
 }
