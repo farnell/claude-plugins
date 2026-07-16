@@ -153,12 +153,48 @@ The @@@CODEX_SESSION_ID@@@ marker handling looks fragile.
 @@@CODEX_SESSION_ID@@@019ee36e-742e-7272-9252-de4a771df7b2@@@END_SID@@@`
     expect(core.parseCodex(raw).sessionId).toBe('019ee36e-742e-7272-9252-de4a771df7b2')
   })
-  it('falls back to a bare trailing uuid when the marker was stripped entirely', () => {
+  it('does NOT fall back to a bare uuid when the marker was stripped — a uuid in review content must never become the session id', () => {
+    // The old third fallback (pickLast of ANY uuid in raw) could capture a uuid
+    // that merely appears in review content — a WRONG session id, worse than none.
     const raw = `@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings\nsession 019f1bfd-144e-7f32-8677-3cba2c0a4f13`
-    expect(core.parseCodex(raw).sessionId).toBe('019f1bfd-144e-7f32-8677-3cba2c0a4f13')
+    expect(core.parseCodex(raw).sessionId).toBeNull()
   })
   it('never captures a session id when none is present', () => {
     expect(core.parseCodex('@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\njust findings, no uuid anywhere').sessionId).toBeNull()
+  })
+
+  // ── stderr diagnostic channel (@@@CODEX_STDERR@@@…@@@END_STDERR@@@) ──
+  it('returns empty stderr when the marker is absent', () => {
+    expect(core.parseCodex(mk(0, 'findings', '')).stderr).toBe('')
+  })
+  it('extracts a fenced stderr block on failure', () => {
+    const r = core.parseCodex('@@@CODEX_RC@@@1\n@@@CODEX_OUTPUT@@@\n\n@@@CODEX_STDERR@@@codex: auth token expired@@@END_STDERR@@@')
+    expect(r.ok).toBe(false)
+    expect(r.stderr).toBe('codex: auth token expired')
+  })
+  it('tolerates multi-line stderr content between the fences', () => {
+    const r = core.parseCodex('@@@CODEX_RC@@@1\n@@@CODEX_STDERR@@@line one\nline two\nline three@@@END_STDERR@@@')
+    expect(r.stderr).toBe('line one\nline two\nline three')
+  })
+  it('the LAST stderr occurrence wins', () => {
+    const raw = '@@@CODEX_RC@@@1\n@@@CODEX_STDERR@@@first@@@END_STDERR@@@\n@@@CODEX_OUTPUT@@@\n\n@@@CODEX_STDERR@@@second@@@END_STDERR@@@'
+    expect(core.parseCodex(raw).stderr).toBe('second')
+  })
+  it('strips the stderr block from content when it appears after @@@CODEX_OUTPUT@@@', () => {
+    const raw = '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings here\n@@@CODEX_STDERR@@@warning: slow network@@@END_STDERR@@@\n@@@CODEX_SESSION_ID@@@019ee36e-742e-7272-9252-de4a771df7b2@@@END_SID@@@'
+    const r = core.parseCodex(raw)
+    expect(r.content).toBe('findings here')
+    expect(r.stderr).toBe('warning: slow network')
+    expect(r.sessionId).toBe('019ee36e-742e-7272-9252-de4a771df7b2')
+    expect(r.ok).toBe(true)
+  })
+  it('an empty fenced stderr block yields empty string', () => {
+    expect(core.parseCodex('@@@CODEX_RC@@@1\n@@@CODEX_STDERR@@@@@@END_STDERR@@@').stderr).toBe('')
+  })
+  it('an unterminated stderr marker is not a block (no END fence → no capture, no strip)', () => {
+    const r = core.parseCodex('@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nprose mentions @@@CODEX_STDERR@@@ without a fence')
+    expect(r.stderr).toBe('')
+    expect(r.content).toContain('@@@CODEX_STDERR@@@')
   })
 })
 
@@ -196,6 +232,116 @@ describe('buildCritique', () => {
   })
   it('uses the demote reason when nothing else is present', () => {
     expect(core.buildCritique({ verifiedFindings: [] }, 'no findings were enumerated')).toMatch(/Cannot accept agreement/)
+  })
+})
+
+// ─── decideResumeAction (pure resume state-machine) ──────────────────────────
+describe('decideResumeAction', () => {
+  const SID = '019ee36e-742e-7272-9252-de4a771df7b2'
+  const claude = (content: string, round = 3) => ({ agent: 'claude', round, content })
+  const codex = (content: string, round = 3) => ({ agent: 'codex', round, content })
+  const human = (content: string, round = 3) => ({ agent: 'human', round, content })
+  const st = (over: Partial<core.ResumeState> = {}): core.ResumeState =>
+    ({ target: 'docs/x.md', history: [], codexSessionId: SID, round: 3, pausedReason: undefined, ...over })
+
+  it('errors when paused on a human question and no humanAnswer was given — message repeats the question', () => {
+    const d = core.decideResumeAction(
+      st({ history: [codex('r'), claude('[ASKED HUMAN] Is the cutover date fixed?')], pausedReason: 'needs_human' }),
+      { maxRounds: 3, humanAnswer: null },
+    )
+    expect(d.action).toBe('error')
+    expect((d as any).message).toContain('Is the cutover date fixed?')
+    expect((d as any).message).not.toContain('[ASKED HUMAN]')
+    expect((d as any).message).toContain('humanAnswer')
+    expect((d as any).message).toContain('docs/x.md')
+  })
+  it('answer_human when paused on a human question and an answer was given', () => {
+    const d = core.decideResumeAction(
+      st({ history: [claude('[ASKED HUMAN] Q?')], pausedReason: 'needs_human' }),
+      { maxRounds: 3, humanAnswer: 'yes, fixed' },
+    )
+    expect(d).toEqual({ action: 'answer_human' })
+  })
+  it('the [ASKED HUMAN] prefix is the discriminator — no trailing-space requirement', () => {
+    const d = core.decideResumeAction(st({ history: [claude('[ASKED HUMAN]tight')] }), { maxRounds: 3, humanAnswer: null })
+    expect(d.action).toBe('error')
+  })
+  it('needs_approval when paused at the round cap and maxRounds was not raised', () => {
+    const d = core.decideResumeAction(
+      st({ history: [claude('critique text')], pausedReason: 'needs_approval', round: 3 }),
+      { maxRounds: 3, humanAnswer: null },
+    )
+    expect(d.action).toBe('needs_approval')
+    expect((d as any).message).toContain('maxRounds: 5') // round + 2 suggested
+    expect((d as any).message).toContain('3-round cap')
+  })
+  it('replay_critique WITHOUT a bump when maxRounds was raised above the completed rounds (approval given)', () => {
+    const d = core.decideResumeAction(
+      st({ history: [claude('critique text')], pausedReason: 'needs_approval', round: 3 }),
+      { maxRounds: 5, humanAnswer: null },
+    )
+    expect(d).toEqual({ action: 'replay_critique', bumpMaxRoundsTo: null })
+  })
+  it('replay_critique WITH a one-round bump on a failure retry at the cap (codex_failed)', () => {
+    const d = core.decideResumeAction(
+      st({ history: [claude('critique text')], pausedReason: 'codex_failed', round: 3 }),
+      { maxRounds: 3, humanAnswer: null },
+    )
+    expect(d).toEqual({ action: 'replay_critique', bumpMaxRoundsTo: 4 })
+  })
+  it('replay_critique with no bump on a failure retry below the cap', () => {
+    const d = core.decideResumeAction(
+      st({ history: [claude('critique text')], pausedReason: 'codex_failed', round: 2 }),
+      { maxRounds: 3, humanAnswer: null },
+    )
+    expect(d).toEqual({ action: 'replay_critique', bumpMaxRoundsTo: null })
+  })
+  it('resume_failed when a claude critique is pending but no session id was captured', () => {
+    const d = core.decideResumeAction(
+      st({ history: [claude('critique text')], codexSessionId: null, pausedReason: 'resume_failed' }),
+      { maxRounds: 3, humanAnswer: null },
+    )
+    expect(d.action).toBe('resume_failed')
+    expect((d as any).message).toMatch(/no Codex session id/)
+  })
+  it('the needs_approval gate outranks the missing-sid check (matches the original inline order)', () => {
+    const d = core.decideResumeAction(
+      st({ history: [claude('critique text')], codexSessionId: null, pausedReason: 'needs_approval', round: 3 }),
+      { maxRounds: 3, humanAnswer: null },
+    )
+    expect(d.action).toBe('needs_approval')
+  })
+  it('proceed when the last turn is Codex (nothing pending)', () => {
+    expect(core.decideResumeAction(st({ history: [claude('c'), codex('reply')] }), { maxRounds: 3, humanAnswer: null }))
+      .toEqual({ action: 'proceed' })
+  })
+  it('proceed when the last turn is a human answer', () => {
+    expect(core.decideResumeAction(st({ history: [claude('[ASKED HUMAN] Q?'), human('Human answer to the open question: yes')] }), { maxRounds: 3, humanAnswer: null }))
+      .toEqual({ action: 'proceed' })
+  })
+  it('proceed on an empty history', () => {
+    expect(core.decideResumeAction(st({ history: [] }), { maxRounds: 3, humanAnswer: null })).toEqual({ action: 'proceed' })
+    expect(core.decideResumeAction(st({ history: undefined }), { maxRounds: 3, humanAnswer: null })).toEqual({ action: 'proceed' })
+  })
+})
+
+// ─── checkStaleness (resume content-identity gate) ───────────────────────────
+describe('checkStaleness', () => {
+  it('not stale when ids match', () => {
+    expect(core.checkStaleness('abc', 'abc', false)).toEqual({ stale: false, block: false })
+  })
+  it('unknown ids never block (version-2 state, hash/gh failure)', () => {
+    expect(core.checkStaleness('', 'abc', false)).toEqual({ stale: false, block: false })
+    expect(core.checkStaleness('abc', '', false)).toEqual({ stale: false, block: false })
+    expect(core.checkStaleness('', '', false)).toEqual({ stale: false, block: false })
+    expect(core.checkStaleness(undefined, 'abc', false)).toEqual({ stale: false, block: false })
+    expect(core.checkStaleness(null, 'abc', false)).toEqual({ stale: false, block: false })
+  })
+  it('differing ids are stale and BLOCK by default', () => {
+    expect(core.checkStaleness('abc', 'def', false)).toEqual({ stale: true, block: true })
+  })
+  it('allowStale keeps stale=true but unblocks', () => {
+    expect(core.checkStaleness('abc', 'def', true)).toEqual({ stale: true, block: false })
   })
 })
 
@@ -315,7 +461,7 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
 
   it('inline helpers behave identically to core for every vector', () => {
     const inline: any = new Function(
-      `${block}\n;return { parseArgs, validateTarget, shortHash, makeStateKey, shq, parseCodex, agreementProblem, buildCritique, COMMENT_MARKER, heredocDelim, splitFindingsByCitation, summarizeAudit, postCommentScript };`
+      `${block}\n;return { parseArgs, validateTarget, shortHash, makeStateKey, shq, parseCodex, agreementProblem, buildCritique, decideResumeAction, checkStaleness, COMMENT_MARKER, heredocDelim, splitFindingsByCitation, summarizeAudit, postCommentScript };`
     )()
 
     const argVectors = [{ target: '249', maxRounds: 3 }, '{"target":"249","resume":true}', 'docs/x.md', '{bad', undefined]
@@ -334,12 +480,20 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
       '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings\n@@@CODEX_SESSION_ID@@@\n019ee36e-742e-7272-9252-de4a771df7b2',
       '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nquotes @@@CODEX_SESSION_ID@@@ inside\n@@@CODEX_SESSION_ID@@@\n019ee36e-742e-7272-9252-de4a771df7b2',
       '@@@CODEX_RC@@@1\n@@@CODEX_OUTPUT@@@\n\n@@@CODEX_SESSION_ID@@@\n',
-      // issue #4 shapes: hoisted-above-output, fenced one-line, bare-uuid fallback, none
+      // issue #4 shapes: hoisted-above-output, fenced one-line, bare-uuid (now null — no tier-3 fallback), none
       '@@@CODEX_RC@@@0\n@@@CODEX_SESSION_ID@@@ 019f1bfd-144e-7f32-8677-3cba2c0a4f13\n\n@@@CODEX_OUTPUT@@@\nfindings',
       '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings\n\n@@@CODEX_SESSION_ID@@@019ee36e-742e-7272-9252-de4a771df7b2@@@END_SID@@@',
       '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nThe @@@CODEX_SESSION_ID@@@ marker\n@@@CODEX_SESSION_ID@@@019ee36e-742e-7272-9252-de4a771df7b2@@@END_SID@@@',
       '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings\nsession 019f1bfd-144e-7f32-8677-3cba2c0a4f13',
       '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\njust findings, no uuid',
+      // stderr diagnostic channel shapes: failure with stderr, multi-line, last-wins,
+      // stderr-after-OUTPUT stripped from content, empty fence, unterminated marker
+      '@@@CODEX_RC@@@1\n@@@CODEX_OUTPUT@@@\n\n@@@CODEX_STDERR@@@codex: auth token expired@@@END_STDERR@@@',
+      '@@@CODEX_RC@@@1\n@@@CODEX_STDERR@@@line one\nline two@@@END_STDERR@@@',
+      '@@@CODEX_RC@@@1\n@@@CODEX_STDERR@@@first@@@END_STDERR@@@\n@@@CODEX_OUTPUT@@@\n\n@@@CODEX_STDERR@@@second@@@END_STDERR@@@',
+      '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nfindings here\n@@@CODEX_STDERR@@@warning: slow@@@END_STDERR@@@\n@@@CODEX_SESSION_ID@@@019ee36e-742e-7272-9252-de4a771df7b2@@@END_SID@@@',
+      '@@@CODEX_RC@@@1\n@@@CODEX_STDERR@@@@@@END_STDERR@@@',
+      '@@@CODEX_RC@@@0\n@@@CODEX_OUTPUT@@@\nprose mentions @@@CODEX_STDERR@@@ without a fence',
     ]
     for (const v of codexVectors) expect(inline.parseCodex(v)).toEqual(core.parseCodex(v))
 
@@ -357,6 +511,30 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
       [{ verifiedFindings: [] }, 'reason'],
     ]
     for (const [c, d] of critVectors) expect(inline.buildCritique(c, d)).toBe(core.buildCritique(c, d))
+
+    // Resume state-machine: one vector per action + the ordering edge cases
+    const cl = (content: string) => ({ agent: 'claude', round: 3, content })
+    const cx = (content: string) => ({ agent: 'codex', round: 3, content })
+    const SID = '019ee36e-742e-7272-9252-de4a771df7b2'
+    const resumeVectors: Array<[any, any]> = [
+      [{ target: 'docs/x.md', history: [cl('[ASKED HUMAN] Q?')], codexSessionId: SID, round: 3, pausedReason: 'needs_human' }, { maxRounds: 3, humanAnswer: null }],
+      [{ target: 'docs/x.md', history: [cl('[ASKED HUMAN] Q?')], codexSessionId: SID, round: 3, pausedReason: 'needs_human' }, { maxRounds: 3, humanAnswer: 'yes' }],
+      [{ target: '242', history: [cl('critique')], codexSessionId: SID, round: 3, pausedReason: 'needs_approval' }, { maxRounds: 3, humanAnswer: null }],
+      [{ target: '242', history: [cl('critique')], codexSessionId: SID, round: 3, pausedReason: 'needs_approval' }, { maxRounds: 5, humanAnswer: null }],
+      [{ target: '242', history: [cl('critique')], codexSessionId: SID, round: 3, pausedReason: 'codex_failed' }, { maxRounds: 3, humanAnswer: null }],
+      [{ target: '242', history: [cl('critique')], codexSessionId: SID, round: 2, pausedReason: 'codex_failed' }, { maxRounds: 3, humanAnswer: null }],
+      [{ target: '242', history: [cl('critique')], codexSessionId: null, round: 3, pausedReason: 'resume_failed' }, { maxRounds: 3, humanAnswer: null }],
+      [{ target: '242', history: [cl('critique')], codexSessionId: null, round: 3, pausedReason: 'needs_approval' }, { maxRounds: 3, humanAnswer: null }],
+      [{ target: '242', history: [cl('c'), cx('reply')], codexSessionId: SID, round: 3, pausedReason: 'codex_failed' }, { maxRounds: 3, humanAnswer: null }],
+      [{ target: '242', history: [], codexSessionId: SID, round: 0, pausedReason: undefined }, { maxRounds: 3, humanAnswer: null }],
+    ]
+    for (const [s, o] of resumeVectors) expect(inline.decideResumeAction(s, o)).toEqual(core.decideResumeAction(s, o))
+
+    const staleVectors: Array<[any, any, boolean]> = [
+      ['abc', 'abc', false], ['abc', 'def', false], ['abc', 'def', true],
+      ['', 'abc', false], ['abc', '', false], ['', '', false], [undefined, 'abc', false],
+    ]
+    for (const [a, b, allow] of staleVectors) expect(inline.checkStaleness(a, b, allow)).toEqual(core.checkStaleness(a, b, allow))
 
     // Summary-comment helpers (mirrored from core.ts; injection-critical)
     expect(inline.COMMENT_MARKER).toBe(core.COMMENT_MARKER)

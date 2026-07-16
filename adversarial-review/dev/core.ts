@@ -20,6 +20,9 @@ export interface ParsedArgs {
   /** Opt-in: post the synthesized result as a single summary comment on the PR
    *  (PR targets only; ignored for file targets). */
   comment?: boolean
+  /** Opt-in: continue a resume even when the target's content changed since the
+   *  review was checkpointed (see checkStaleness). */
+  allowStale?: boolean
 }
 
 /** Tolerant arg parsing — the tool boundary may deliver an object, a JSON
@@ -74,7 +77,7 @@ export function extractThreadId(eventsRaw: string): string | null {
   return m ? (m[1].match(UUID_RE)?.[0] || null) : null
 }
 
-export interface CodexResult { content: string; sessionId: string | null; rc: number | null; ok: boolean }
+export interface CodexResult { content: string; sessionId: string | null; rc: number | null; ok: boolean; stderr: string }
 
 /** Parse a codex-runner subagent's return text. The review body can itself
  *  quote the delimiters (e.g. when Codex reviews this workflow), so OUTPUT is
@@ -93,15 +96,30 @@ export interface CodexResult { content: string; sessionId: string | null; rc: nu
  *    1. fenced  `@@@CODEX_SESSION_ID@@@<uuid>@@@END_SID@@@`  — the emitted form;
  *       prose that mentions the bare marker won't carry the closing fence.
  *    2. marker + uuid (any whitespace, any position) — tolerates a stripped fence.
- *    3. bare trailing uuid — last resort when the marker was stripped entirely. */
+ *  There is deliberately NO bare-uuid fallback: any uuid that merely appears in
+ *  the review content (quoted ids, example uuids) would be captured as the
+ *  session id, and a WRONG session id (resume replays into someone else's
+ *  thread) is strictly worse than none (clean resume_failed).
+ *
+ *  stderr diagnostic channel: the codex bash may emit
+ *  `@@@CODEX_STDERR@@@<tail of stderr>@@@END_STDERR@@@` on failure. The LAST
+ *  fenced occurrence wins (multi-line content tolerated); absent → ''. The
+ *  block is stripped from `content` so diagnostics never leak into the review
+ *  body. */
 export function parseCodex(raw: string): CodexResult {
   const rcM = raw.match(/@@@CODEX_RC@@@(-?\d+)/)
   const rc = rcM ? parseInt(rcM[1], 10) : null
+  const STDERR_RE = /@@@CODEX_STDERR@@@([\s\S]*?)@@@END_STDERR@@@/g
+  let stderr = ''
+  let sm: RegExpExecArray | null
+  while ((sm = STDERR_RE.exec(raw)) !== null) stderr = sm[1].trim()
   const afterOut = raw.includes('@@@CODEX_OUTPUT@@@')
     ? raw.split('@@@CODEX_OUTPUT@@@').slice(1).join('@@@CODEX_OUTPUT@@@')
     : raw
   const sidParts = afterOut.split('@@@CODEX_SESSION_ID@@@')
-  const content = (sidParts.length > 1 ? sidParts.slice(0, -1).join('@@@CODEX_SESSION_ID@@@') : afterOut).trim()
+  const content = (sidParts.length > 1 ? sidParts.slice(0, -1).join('@@@CODEX_SESSION_ID@@@') : afterOut)
+    .replace(/@@@CODEX_STDERR@@@[\s\S]*?@@@END_STDERR@@@/g, '')
+    .trim()
   const U = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
   const pickLast = (re: RegExp): string | null => {
     let m: RegExpExecArray | null, last: string | null = null
@@ -110,9 +128,8 @@ export function parseCodex(raw: string): CodexResult {
   }
   const sessionId =
     pickLast(new RegExp(`@@@CODEX_SESSION_ID@@@\\s*(${U})\\s*@@@END_SID@@@`, 'gi')) ||
-    pickLast(new RegExp(`@@@CODEX_SESSION_ID@@@\\s*(${U})`, 'gi')) ||
-    pickLast(new RegExp(`(${U})`, 'gi'))
-  return { content, sessionId, rc, ok: rc === 0 && content.length > 0 }
+    pickLast(new RegExp(`@@@CODEX_SESSION_ID@@@\\s*(${U})`, 'gi'))
+  return { content, sessionId, rc, ok: rc === 0 && content.length > 0, stderr }
 }
 
 export interface CritiqueResult {
@@ -149,6 +166,89 @@ export function buildCritique(cr: CritiqueResult, demoteReason: string | null): 
   if ((cr.missedFindings || []).length) parts.push('MISSED:\n' + (cr.missedFindings || []).join('\n'))
   if (demoteReason && !parts.length) parts.push(`Cannot accept agreement yet: ${demoteReason}. Please re-examine.`)
   return parts.join('\n\n') || 'Please re-examine the findings.'
+}
+
+// ─── Resume helpers ──────────────────────────────────────────────────────────
+
+export interface ResumeHistoryEntry { agent: string; round: number; content: string }
+
+/** The decision-relevant slice of a parsed saved state. `codexSessionId` must
+ *  already be shape-validated by the caller (the state file is user-writable
+ *  JSON); `round` is the caller's derived critiqueRounds. */
+export interface ResumeState {
+  target?: string
+  history?: ResumeHistoryEntry[]
+  codexSessionId: string | null
+  round: number
+  pausedReason?: string | null
+}
+
+export interface ResumeOpts { maxRounds: number; humanAnswer?: string | null }
+
+export type ResumeDecision =
+  | { action: 'error'; message: string }
+  | { action: 'answer_human' }
+  | { action: 'needs_approval'; message: string }
+  | { action: 'resume_failed'; message: string }
+  | { action: 'replay_critique'; bumpMaxRoundsTo: number | null }
+  | { action: 'proceed' }
+
+/** Pure resume state-machine: given a loaded checkpoint and the resume args,
+ *  decide what the workflow must do next. The caller performs the side effects
+ *  (history.push, saveState, replaying the critique to Codex, returning
+ *  statuses). Discriminators, in order:
+ *    - last history entry is a Claude `[ASKED HUMAN] …` turn → the review is
+ *      paused on a human question: without humanAnswer that's an error (repeat
+ *      the question); with one, append it and fall through to the loop.
+ *    - last entry is any other Claude turn → a critique is pending delivery to
+ *      Codex. If we paused at the round cap (pausedReason='needs_approval') and
+ *      maxRounds was NOT raised above the completed rounds, resuming means
+ *      requesting MORE rounds — gate on explicit approval. A failure pause
+ *      (codex_failed / resume_failed) instead allows ONE extra round
+ *      (bumpMaxRoundsTo) so the retry can make progress. No session id →
+ *      resume_failed (the critique cannot be replayed).
+ *    - anything else (last turn was Codex's or the human's) → proceed straight
+ *      to the loop. */
+export function decideResumeAction(state: ResumeState, opts: ResumeOpts): ResumeDecision {
+  const history = state.history || []
+  const last = history[history.length - 1]
+  if (last && last.agent === 'claude') {
+    if (last.content.startsWith('[ASKED HUMAN]')) {
+      if (!opts.humanAnswer) {
+        return {
+          action: 'error',
+          message: `This review is paused waiting for a human answer to: "${last.content.replace('[ASKED HUMAN] ', '')}". Re-invoke with { target: "${state.target}", resume: true, humanAnswer: "<your answer>" }.`,
+        }
+      }
+      return { action: 'answer_human' }
+    }
+    if (state.pausedReason === 'needs_approval' && opts.maxRounds <= state.round) {
+      return {
+        action: 'needs_approval',
+        message: `This review paused at the ${state.round}-round cap. To APPROVE more rounds, re-invoke with { target: "${state.target}", resume: true, maxRounds: ${state.round + 2} } (a value greater than ${state.round}). Nothing was changed.`,
+      }
+    }
+    if (!state.codexSessionId) {
+      return { action: 'resume_failed', message: `Cannot resume — no Codex session id was captured. Start a fresh review.` }
+    }
+    return { action: 'replay_critique', bumpMaxRoundsTo: opts.maxRounds <= state.round ? state.round + 1 : null }
+  }
+  return { action: 'proceed' }
+}
+
+/** Staleness gate for resume: the checkpointed Codex session reviewed the
+ *  target as it WAS; if the content identity changed underneath (file edited /
+ *  PR got new commits), resuming replays critiques against outdated context.
+ *  `stale` only when BOTH ids are known (non-empty) and differ — a missing id
+ *  on either side (version-2 state without contentId, hash/gh failure) reads as
+ *  unknown and never blocks. `block` = stale and not explicitly overridden. */
+export function checkStaleness(
+  savedId: string | null | undefined,
+  currentId: string | null | undefined,
+  allowStale: boolean,
+): { stale: boolean; block: boolean } {
+  const stale = !!savedId && !!currentId && savedId !== currentId
+  return { stale, block: stale && allowStale !== true }
 }
 
 // ─── Summary-comment helpers (PR upsert) ─────────────────────────────────────
