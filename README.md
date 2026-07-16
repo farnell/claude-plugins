@@ -54,6 +54,10 @@ curl -o ~/.claude/workflows/adversarial-review.js \
 
 Tuning (optional): pass `effort` (`low`|`medium`|`high`|`xhigh`|`max`) and/or `model` to change the Codex run. Defaults are model **`gpt-5.6-sol`** and effort **`high`** for both PRs and files (drop to `medium`/`low` for a faster, shallower pass on big files). Long runs are fine — Codex is launched detached and polled, so there's no 10-minute ceiling.
 
+> **What exactly gets reviewed?**
+> - **PR targets** always review the **latest version of the PR on GitHub**. The tool fetches the PR's newest commits itself every run, so it doesn't matter what branch you have checked out or whether you remembered to `git pull`. (If it can't reach GitHub it falls back to your local checkout and says so.)
+> - **File targets** review the **copy on your disk**, exactly as it is right now — including unsaved-to-git edits. That's usually what you want (you're reviewing something you just wrote), but it means the tool does *not* fetch the latest team version: if someone else changed the file on `main`, `git pull` first.
+
 <details>
 <summary><strong>Setting up Codex</strong> (optional — skip if <code>codex</code> already works)</summary>
 
