@@ -20,6 +20,9 @@ export interface ParsedArgs {
   /** Opt-in: post the synthesized result as a single summary comment on the PR
    *  (PR targets only; ignored for file targets). */
   comment?: boolean
+  /** Opt-in: continue a resume even when the target's content changed since the
+   *  review was checkpointed (see checkStaleness). */
+  allowStale?: boolean
 }
 
 /** Tolerant arg parsing — the tool boundary may deliver an object, a JSON
@@ -74,7 +77,7 @@ export function extractThreadId(eventsRaw: string): string | null {
   return m ? (m[1].match(UUID_RE)?.[0] || null) : null
 }
 
-export interface CodexResult { content: string; sessionId: string | null; rc: number | null; ok: boolean }
+export interface CodexResult { content: string; sessionId: string | null; rc: number | null; ok: boolean; stderr: string }
 
 /** Parse a codex-runner subagent's return text. The review body can itself
  *  quote the delimiters (e.g. when Codex reviews this workflow), so OUTPUT is
@@ -93,15 +96,30 @@ export interface CodexResult { content: string; sessionId: string | null; rc: nu
  *    1. fenced  `@@@CODEX_SESSION_ID@@@<uuid>@@@END_SID@@@`  — the emitted form;
  *       prose that mentions the bare marker won't carry the closing fence.
  *    2. marker + uuid (any whitespace, any position) — tolerates a stripped fence.
- *    3. bare trailing uuid — last resort when the marker was stripped entirely. */
+ *  There is deliberately NO bare-uuid fallback: any uuid that merely appears in
+ *  the review content (quoted ids, example uuids) would be captured as the
+ *  session id, and a WRONG session id (resume replays into someone else's
+ *  thread) is strictly worse than none (clean resume_failed).
+ *
+ *  stderr diagnostic channel: the codex bash may emit
+ *  `@@@CODEX_STDERR@@@<tail of stderr>@@@END_STDERR@@@` on failure. The LAST
+ *  fenced occurrence wins (multi-line content tolerated); absent → ''. The
+ *  block is stripped from `content` so diagnostics never leak into the review
+ *  body. */
 export function parseCodex(raw: string): CodexResult {
   const rcM = raw.match(/@@@CODEX_RC@@@(-?\d+)/)
   const rc = rcM ? parseInt(rcM[1], 10) : null
+  const STDERR_RE = /@@@CODEX_STDERR@@@([\s\S]*?)@@@END_STDERR@@@/g
+  let stderr = ''
+  let sm: RegExpExecArray | null
+  while ((sm = STDERR_RE.exec(raw)) !== null) stderr = sm[1].trim()
   const afterOut = raw.includes('@@@CODEX_OUTPUT@@@')
     ? raw.split('@@@CODEX_OUTPUT@@@').slice(1).join('@@@CODEX_OUTPUT@@@')
     : raw
   const sidParts = afterOut.split('@@@CODEX_SESSION_ID@@@')
-  const content = (sidParts.length > 1 ? sidParts.slice(0, -1).join('@@@CODEX_SESSION_ID@@@') : afterOut).trim()
+  const content = (sidParts.length > 1 ? sidParts.slice(0, -1).join('@@@CODEX_SESSION_ID@@@') : afterOut)
+    .replace(/@@@CODEX_STDERR@@@[\s\S]*?@@@END_STDERR@@@/g, '')
+    .trim()
   const U = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
   const pickLast = (re: RegExp): string | null => {
     let m: RegExpExecArray | null, last: string | null = null
@@ -110,9 +128,93 @@ export function parseCodex(raw: string): CodexResult {
   }
   const sessionId =
     pickLast(new RegExp(`@@@CODEX_SESSION_ID@@@\\s*(${U})\\s*@@@END_SID@@@`, 'gi')) ||
-    pickLast(new RegExp(`@@@CODEX_SESSION_ID@@@\\s*(${U})`, 'gi')) ||
-    pickLast(new RegExp(`(${U})`, 'gi'))
-  return { content, sessionId, rc, ok: rc === 0 && content.length > 0 }
+    pickLast(new RegExp(`@@@CODEX_SESSION_ID@@@\\s*(${U})`, 'gi'))
+  return { content, sessionId, rc, ok: rc === 0 && content.length > 0, stderr }
+}
+
+// ─── Codex launch / poll / harvest command builders ─────────────────────────
+// The codex run used to be ONE foreground bash call inside the codex-runner
+// subagent, which capped every review at the Bash tool's 10-minute timeout
+// (a long high-effort run died mid-flight as codex_failed). The run is now
+// split into three short commands the subagent issues as SEPARATE Bash calls:
+//
+//   launch  → mktemp a per-run dir (echoed self-delimiting as
+//             @@@CODEX_RUNDIR@@@<dir>@@@END_RUNDIR@@@), start codex detached
+//             (nohup … & disown) and return immediately. The detached wrapper
+//             writes codex's exit code to $D/rc as its LAST step, so the rc
+//             file's existence IS the completion signal.
+//   poll    → cheap existence probe of $D/rc → DONE / RUNNING.
+//   harvest → emit EXACTLY the marker grammar parseCodex expects
+//             (@@@CODEX_RC@@@ / @@@CODEX_OUTPUT@@@ / fenced stderr / fenced
+//             session id), then remove the run dir (prefix-guarded rm).
+//
+// All three are pure string builders so the protocol is unit-testable.
+
+/** Launch codex detached. `flags` is the pre-validated model/effort flag
+ *  string; `promptShq` an shq()-quoted prompt. `resumeSid` null → initial
+ *  review (`codex exec`, with the `--json` event stream captured to
+ *  $D/events.json for the harvest's session-id grep); a validated uuid →
+ *  `codex exec resume <sid>`. `rootOverride` '' → derive the repo root
+ *  in-shell (git rev-parse, today's behaviour); non-empty (e.g. the PR-head
+ *  worktree) → cd there instead. The prompt travels into the detached shell
+ *  as a POSITIONAL ARG ($2) — never nested inside the single-quoted `sh -c`
+ *  body, so the shq quoting survives intact. */
+export function codexLaunchCmd(flags: string, promptShq: string, resumeSid: string | null, rootOverride: string): string {
+  const exec = resumeSid ? `codex exec resume ${resumeSid} --json ${flags}` : `codex exec --json ${flags}`
+  return [
+    rootOverride ? `ROOT=${shq(rootOverride)}` : `ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`,
+    `D="$(mktemp -d -t adv_run.XXXXXX)"`,
+    `echo "@@@CODEX_RUNDIR@@@$D@@@END_RUNDIR@@@"`,
+    `cd "$ROOT" && nohup sh -c '${exec} --output-last-message "$1/out" "$2" > "$1/events.json" 2> "$1/stderr.log"; echo $? > "$1/rc"' sh "$D" ${promptShq} > /dev/null 2>&1 &`,
+    `disown 2>/dev/null || true`,
+  ].join('\n')
+}
+
+/** Completion probe: the rc file is written LAST by the launch wrapper, so its
+ *  existence is the completion signal. The runner subagent may wrap this in a
+ *  bounded sleep loop — the bare probe is the permission-safe fallback. */
+export function codexPollCmd(runDir: string): string {
+  return `D=${shq(runDir)}\ntest -f "$D/rc" && echo DONE || echo RUNNING`
+}
+
+/** Harvest a finished run: emits EXACTLY the marker protocol parseCodex
+ *  expects — @@@CODEX_RC@@@<rc> (missing/unreadable rc file reads as 1),
+ *  @@@CODEX_OUTPUT@@@ + the last-message file (success only), a fenced
+ *  @@@CODEX_STDERR@@@ 2000-byte tail on failure, and (initial only) the
+ *  session id grepped from the --json event stream, fenced self-delimiting on
+ *  one line. Ends by removing the run dir, guarded so only a path matching
+ *  the mktemp template (basename starts with `adv_run.`) is ever touched.
+ *  Cleanup is deliberately rm -f of the four known flat files + rmdir — never
+ *  rm -rf — so the shipped permission allowlist needs no standing
+ *  `Bash(rm -rf:*)` grant (rm -f is already allowlisted; an unexpected extra
+ *  file just leaves the dir behind for tmp reaping). */
+export function codexHarvestCmd(runDir: string, initial: boolean): string {
+  const lines = [
+    `D=${shq(runDir)}`,
+    `RC="$(cat "$D/rc" 2>/dev/null)"`,
+    'echo "@@@CODEX_RC@@@${RC:-1}"',
+    `echo "@@@CODEX_OUTPUT@@@"`,
+    `[ "$RC" = "0" ] && cat "$D/out"`,
+    `echo`,
+    `if [ "$RC" != "0" ] && [ -s "$D/stderr.log" ]; then printf '@@@CODEX_STDERR@@@%s@@@END_STDERR@@@\\n' "$(tail -c 2000 "$D/stderr.log")"; fi`,
+  ]
+  if (initial) {
+    lines.push(
+      `SID=""; [ "$RC" = "0" ] && SID="$(grep -o '"thread_id":"[0-9a-f-]\\{36\\}"' "$D/events.json" | head -1 | grep -o '[0-9a-f-]\\{36\\}' | head -1)"`,
+      `echo "@@@CODEX_SESSION_ID@@@$SID@@@END_SID@@@"`,
+    )
+  }
+  lines.push(`case "$D" in */adv_run.*) rm -f "$D"/out "$D"/events.json "$D"/stderr.log "$D"/rc && rmdir "$D" 2>/dev/null;; esac`)
+  return lines.join('\n')
+}
+
+/** ONE automatic retry policy for a failed codex call: retry only when it
+ *  plausibly helps — any failure (non-zero rc, missing rc marker, or rc 0
+ *  with empty content) EXCEPT the poll-budget timeout (rc 124), where a
+ *  second hour-long grind would hit the same wall; the fix there is a lower
+ *  reasoning effort, surfaced in the codex_failed message instead. */
+export function shouldRetryCodex(p: { ok: boolean; rc: number | null }): boolean {
+  return !p.ok && p.rc !== 124
 }
 
 export interface CritiqueResult {
@@ -149,6 +251,89 @@ export function buildCritique(cr: CritiqueResult, demoteReason: string | null): 
   if ((cr.missedFindings || []).length) parts.push('MISSED:\n' + (cr.missedFindings || []).join('\n'))
   if (demoteReason && !parts.length) parts.push(`Cannot accept agreement yet: ${demoteReason}. Please re-examine.`)
   return parts.join('\n\n') || 'Please re-examine the findings.'
+}
+
+// ─── Resume helpers ──────────────────────────────────────────────────────────
+
+export interface ResumeHistoryEntry { agent: string; round: number; content: string }
+
+/** The decision-relevant slice of a parsed saved state. `codexSessionId` must
+ *  already be shape-validated by the caller (the state file is user-writable
+ *  JSON); `round` is the caller's derived critiqueRounds. */
+export interface ResumeState {
+  target?: string
+  history?: ResumeHistoryEntry[]
+  codexSessionId: string | null
+  round: number
+  pausedReason?: string | null
+}
+
+export interface ResumeOpts { maxRounds: number; humanAnswer?: string | null }
+
+export type ResumeDecision =
+  | { action: 'error'; message: string }
+  | { action: 'answer_human' }
+  | { action: 'needs_approval'; message: string }
+  | { action: 'resume_failed'; message: string }
+  | { action: 'replay_critique'; bumpMaxRoundsTo: number | null }
+  | { action: 'proceed' }
+
+/** Pure resume state-machine: given a loaded checkpoint and the resume args,
+ *  decide what the workflow must do next. The caller performs the side effects
+ *  (history.push, saveState, replaying the critique to Codex, returning
+ *  statuses). Discriminators, in order:
+ *    - last history entry is a Claude `[ASKED HUMAN] …` turn → the review is
+ *      paused on a human question: without humanAnswer that's an error (repeat
+ *      the question); with one, append it and fall through to the loop.
+ *    - last entry is any other Claude turn → a critique is pending delivery to
+ *      Codex. If we paused at the round cap (pausedReason='needs_approval') and
+ *      maxRounds was NOT raised above the completed rounds, resuming means
+ *      requesting MORE rounds — gate on explicit approval. A failure pause
+ *      (codex_failed / resume_failed) instead allows ONE extra round
+ *      (bumpMaxRoundsTo) so the retry can make progress. No session id →
+ *      resume_failed (the critique cannot be replayed).
+ *    - anything else (last turn was Codex's or the human's) → proceed straight
+ *      to the loop. */
+export function decideResumeAction(state: ResumeState, opts: ResumeOpts): ResumeDecision {
+  const history = state.history || []
+  const last = history[history.length - 1]
+  if (last && last.agent === 'claude') {
+    if (last.content.startsWith('[ASKED HUMAN]')) {
+      if (!opts.humanAnswer) {
+        return {
+          action: 'error',
+          message: `This review is paused waiting for a human answer to: "${last.content.replace('[ASKED HUMAN] ', '')}". Re-invoke with { target: "${state.target}", resume: true, humanAnswer: "<your answer>" }.`,
+        }
+      }
+      return { action: 'answer_human' }
+    }
+    if (state.pausedReason === 'needs_approval' && opts.maxRounds <= state.round) {
+      return {
+        action: 'needs_approval',
+        message: `This review paused at the ${state.round}-round cap. To APPROVE more rounds, re-invoke with { target: "${state.target}", resume: true, maxRounds: ${state.round + 2} } (a value greater than ${state.round}). Nothing was changed.`,
+      }
+    }
+    if (!state.codexSessionId) {
+      return { action: 'resume_failed', message: `Cannot resume — no Codex session id was captured. Start a fresh review.` }
+    }
+    return { action: 'replay_critique', bumpMaxRoundsTo: opts.maxRounds <= state.round ? state.round + 1 : null }
+  }
+  return { action: 'proceed' }
+}
+
+/** Staleness gate for resume: the checkpointed Codex session reviewed the
+ *  target as it WAS; if the content identity changed underneath (file edited /
+ *  PR got new commits), resuming replays critiques against outdated context.
+ *  `stale` only when BOTH ids are known (non-empty) and differ — a missing id
+ *  on either side (version-2 state without contentId, hash/gh failure) reads as
+ *  unknown and never blocks. `block` = stale and not explicitly overridden. */
+export function checkStaleness(
+  savedId: string | null | undefined,
+  currentId: string | null | undefined,
+  allowStale: boolean,
+): { stale: boolean; block: boolean } {
+  const stale = !!savedId && !!currentId && savedId !== currentId
+  return { stale, block: stale && allowStale !== true }
 }
 
 // ─── Summary-comment helpers (PR upsert) ─────────────────────────────────────
@@ -268,4 +453,179 @@ export function postCommentScript(target: string, marker: string, body: string):
     `echo "@@@ADV_COMMENT_RC@@@$RC"; echo "@@@ADV_COMMENT_ACTION@@@$ACTION"; echo "@@@ADV_COMMENT_URL@@@$URL"`,
     `fi; fi`,
   ].join('\n')
+}
+
+/** Rewrite `file:line` refs inside a citation string as GitHub permalinks
+ *  (`[file:line](https://github.com/<slug>/blob/<oid>/<file>#L<line>)`).
+ *  ONLY refs in `okRefs` (the citation audit's status==='ok' set) are linkified
+ *  — linkifying an unresolved ref would lend it false credibility — and refs
+ *  containing `..` are skipped (CITE_RE's charset admits them; the audit
+ *  filters them, so they can never be ok, but skip defensively). When the repo
+ *  slug or head oid is unknown (empty), the citation is returned unchanged. */
+export function linkifyCitation(citation: string, repoSlug: string, headOid: string, okRefs: Set<string>): string {
+  if (!repoSlug || !headOid) return String(citation)
+  return String(citation).replace(CITE_RE, (m, file, line) => {
+    const ref = `${file}:${line}`
+    if (file.includes('..') || !okRefs.has(ref)) return m
+    return `[${ref}](https://github.com/${repoSlug}/blob/${headOid}/${file}#L${line})`
+  })
+}
+
+// ─── Summary-comment renderer ────────────────────────────────────────────────
+const SEV_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 }
+const SEV_BADGE: Record<string, string> = { critical: '🔴 critical', high: '🟠 high', medium: '🟡 medium', low: '⚪ low' }
+
+export interface SynthesisLike {
+  summary?: string
+  agreedFindings?: Array<{ finding?: string; severity?: string; actionItem?: string; citation?: string; refuterNote?: string }>
+  unresolvedPoints?: Array<{ point?: string; codexView?: string; claudeView?: string }>
+  prioritizedActionItems?: string[]
+}
+export interface CitationAuditLike { checked: number; unresolved: number; badRefs?: string[]; results?: AuditResult[] }
+
+/** Render the synthesized review as the PR summary comment body. Findings are
+ *  severity-sorted, then FAIL-CLOSED bucketed by splitFindingsByCitation into
+ *  confirmed vs citation-unverified. `auditedPrHead` records WHERE the citation
+ *  audit ran: true = against a materialized PR-head worktree, so an unresolved
+ *  ref cannot be excused as "not on this branch"; false = against the user's
+ *  current checkout (the fallback when no worktree could be created), where a
+ *  ref may fail to resolve simply because the PR branch is not checked out.
+ *  `modelName` is the Codex model id rendered in the heading (the caller's
+ *  validated CODEX_MODEL) — no hardcoded model string here. `repoSlug` +
+ *  `headOid` (both '' when unknown / file target) turn audit-confirmed
+ *  `file:line` refs into GitHub permalinks via linkifyCitation; a linkified
+ *  citation drops the backticks (a markdown link inside backticks doesn't
+ *  render), an unlinkified one keeps them. */
+export function buildCommentBody(syn: SynthesisLike, audit: CitationAuditLike | undefined | null, didAgree: boolean, rounds: number, auditedPrHead: boolean, modelName: string, repoSlug: string, headOid: string): string {
+  const sorted = [...(syn.agreedFindings || [])].sort(
+    (a, b) => (SEV_RANK[a.severity ?? ''] ?? 9) - (SEV_RANK[b.severity ?? ''] ?? 9)
+  )
+  // A finding whose cited file:line did NOT resolve must not be sold as
+  // "confirmed" (the footer defines confirmed = citation resolves) — split it
+  // into its own re-check bucket so the comment never contradicts itself.
+  const { confirmed, unresolved } = splitFindingsByCitation(sorted, audit && audit.results || undefined)
+  const disputed = syn.unresolvedPoints || []
+  // Only audit-confirmed refs get permalinks (linkifyCitation ignores the rest).
+  const okRefs = new Set(((audit && audit.results) || []).filter((r) => r && r.status === 'ok').map((r) => r.ref))
+  const fmt = (f: { finding?: string; severity?: string; actionItem?: string; citation?: string; refuterNote?: string }) => {
+    const cite = f.citation ? String(f.citation) : ''
+    const linked = cite ? linkifyCitation(cite, repoSlug, headOid, okRefs) : ''
+    const citePart = cite ? (linked !== cite ? ` ${linked}` : ` \`${cite}\``) : ''
+    const out = [`- **${SEV_BADGE[f.severity ?? ''] || f.severity || ''}** — ${f.finding}${citePart}`]
+    if (f.actionItem) out.push(`  - ↳ ${f.actionItem}`)
+    if (f.refuterNote) out.push(`  - 🛡️ refuter (low confidence): ${f.refuterNote}`)
+    return out
+  }
+  const L = [COMMENT_MARKER, `## 🔬 Adversarial review — Codex (${modelName}) × Claude`, '']
+  if (syn.summary) L.push(`> ${String(syn.summary).replace(/\s*\n+\s*/g, ' ')}`, '')
+  const status = didAgree
+    ? `✅ Full agreement after ${rounds} round(s)`
+    : `⚠️ ${rounds} round(s), no full agreement`
+  L.push(`**Status:** ${status} · **${confirmed.length}** confirmed · **${unresolved.length}** unverified · **${disputed.length}** disputed`, '')
+
+  L.push('### ✅ Confirmed findings')
+  if (!confirmed.length) L.push('_None._')
+  else for (const f of confirmed) L.push(...fmt(f))
+  L.push('')
+
+  if (unresolved.length) {
+    L.push('### ⚠️ Agreed, but citation not verified against source — re-check before acting')
+    for (const f of unresolved) L.push(...fmt(f))
+    L.push('')
+  }
+
+  L.push('### ⚖️ Disputed — needs human judgement')
+  if (!disputed.length) L.push('_None._')
+  else for (const d of disputed) {
+    L.push(`- **${d.point}**`)
+    if (d.codexView) L.push(`  - **Codex:** ${d.codexView}`)
+    if (d.claudeView) L.push(`  - **Claude:** ${d.claudeView}`)
+  }
+  L.push('')
+
+  const actions = syn.prioritizedActionItems || []
+  if (actions.length) {
+    L.push('### 📋 Prioritized actions')
+    actions.forEach((a, i) => L.push(`${i + 1}. ${a}`))
+    L.push('')
+  }
+
+  if (audit && audit.unresolved > 0) {
+    const bad = (audit.badRefs || []).join(', ')
+    L.push(auditedPrHead
+      // The audit ran against the PR head itself — an unresolved ref is
+      // genuinely stale/hallucinated/unaudited, not a branch mismatch.
+      ? `> ⚠️ ${audit.unresolved}/${audit.checked} cited \`file:line\` refs did not resolve against the PR head (stale, hallucinated, or not audited): ${bad}.`
+      // Checkout-relative fallback — the ref may simply not be on this branch.
+      : `> ⚠️ ${audit.unresolved}/${audit.checked} cited \`file:line\` refs did not resolve against the current checkout (stale, hallucinated, not audited, or not on this branch): ${bad}.`, '')
+  }
+
+  L.push('---', '<sub>🤖 Posted by `/adversarial-review`. Confirmed = both models agree AND every cited file:line was checked and resolves; “unverified” = agreed but the citation is missing, isn’t a file:line, or didn’t resolve — re-check manually; disputed = stable disagreement for a human.</sub>')
+  return L.join('\n')
+}
+
+// ─── Blind round-1 review rendering (anchoring fix) ──────────────────────────
+
+export interface BlindFinding { finding?: string; citation?: string; severity?: string }
+export interface BlindReview { findings?: BlindFinding[]; cleanAssessment?: string }
+
+/** Render the blind Claude round-1 review compactly for the debate history:
+ *  one bullet per finding (`finding (citation) [severity]`), or the
+ *  cleanAssessment when the findings list is empty. Tolerates missing fields —
+ *  the schema requires them, but the agent's output is untrusted transport. */
+export function renderBlindReview(blind: BlindReview | null | undefined): string {
+  const findings = (blind && Array.isArray(blind.findings) ? blind.findings : []).filter((f) => f && f.finding)
+  if (!findings.length) {
+    const assessment = blind && typeof blind.cleanAssessment === 'string' && blind.cleanAssessment.trim()
+      ? blind.cleanAssessment.trim()
+      : 'clean — no assessment provided'
+    return `BLIND REVIEW — no findings. ${assessment}`
+  }
+  return findings
+    .map((f) => `• ${f.finding}${f.citation ? ` (${f.citation})` : ''}${f.severity ? ` [${f.severity}]` : ''}`)
+    .join('\n')
+}
+
+// ─── Post-synthesis refuter pass (shared-hallucination fix) ──────────────────
+
+/** Pick which agreed findings get a fresh-context refuter when there are more
+ *  than `cap`: the top `cap` by severity rank (critical first; unknown
+ *  severities last), ties broken by original position. Returns ORIGINAL
+ *  indices in ascending order so refuter results map back positionally. */
+export function selectRefutationIndices(findings: Array<{ severity?: string }>, cap: number): number[] {
+  const idx = (findings || []).map((_, i) => i)
+  if (idx.length <= cap) return idx
+  return idx
+    .map((i) => ({ i, rank: SEV_RANK[findings[i]?.severity ?? ''] ?? 9 }))
+    .sort((a, b) => a.rank - b.rank || a.i - b.i)
+    .slice(0, cap)
+    .map((x) => x.i)
+    .sort((a, b) => a - b)
+}
+
+export interface Refutation { refuted?: boolean; reasoning?: string; confidence?: string }
+
+/** Apply refuter verdicts to the agreed findings. `refutations` is
+ *  POSITIONALLY parallel to `agreedFindings` (null = no refuter ran for that
+ *  finding — capped out or agent failure — which KEEPS the finding
+ *  un-annotated: the refuter is an EXTRA gate, so it fails OPEN).
+ *  - refuted:true at high/medium confidence → the finding moves OUT of the
+ *    kept set into `refuted` (with the refuter's reasoning).
+ *  - refuted:true at low (or unrecognized) confidence → kept, annotated with
+ *    `refuterNote: reasoning` so a human sees the doubt.
+ *  - refuted:false (or malformed) → kept unchanged. */
+export function applyRefutations<T extends object>(
+  agreedFindings: T[],
+  refutations: Array<Refutation | null | undefined>,
+): { kept: Array<T & { refuterNote?: string }>; refuted: Array<{ finding: T; reasoning: string }> } {
+  const kept: Array<T & { refuterNote?: string }> = []
+  const refuted: Array<{ finding: T; reasoning: string }> = []
+  ;(agreedFindings || []).forEach((f, i) => {
+    const r = refutations ? refutations[i] : null
+    if (!r || r.refuted !== true) { kept.push(f); return }
+    const reasoning = typeof r.reasoning === 'string' ? r.reasoning : ''
+    if (r.confidence === 'high' || r.confidence === 'medium') refuted.push({ finding: f, reasoning })
+    else kept.push({ ...f, refuterNote: reasoning })
+  })
+  return { kept, refuted }
 }
