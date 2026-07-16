@@ -469,8 +469,10 @@ export interface CitationAuditLike { checked: number; unresolved: number; badRef
  *  audit ran: true = against a materialized PR-head worktree, so an unresolved
  *  ref cannot be excused as "not on this branch"; false = against the user's
  *  current checkout (the fallback when no worktree could be created), where a
- *  ref may fail to resolve simply because the PR branch is not checked out. */
-export function buildCommentBody(syn: SynthesisLike, audit: CitationAuditLike | undefined | null, didAgree: boolean, rounds: number, auditedPrHead: boolean): string {
+ *  ref may fail to resolve simply because the PR branch is not checked out.
+ *  `modelName` is the Codex model id rendered in the heading (the caller's
+ *  validated CODEX_MODEL) — no hardcoded model string here. */
+export function buildCommentBody(syn: SynthesisLike, audit: CitationAuditLike | undefined | null, didAgree: boolean, rounds: number, auditedPrHead: boolean, modelName: string): string {
   const sorted = [...(syn.agreedFindings || [])].sort(
     (a, b) => (SEV_RANK[a.severity ?? ''] ?? 9) - (SEV_RANK[b.severity ?? ''] ?? 9)
   )
@@ -484,7 +486,7 @@ export function buildCommentBody(syn: SynthesisLike, audit: CitationAuditLike | 
     if (f.actionItem) out.push(`  - ↳ ${f.actionItem}`)
     return out
   }
-  const L = [COMMENT_MARKER, '## 🔬 Adversarial review — Codex (gpt-5.5) × Claude', '']
+  const L = [COMMENT_MARKER, `## 🔬 Adversarial review — Codex (${modelName}) × Claude`, '']
   if (syn.summary) L.push(`> ${String(syn.summary).replace(/\s*\n+\s*/g, ' ')}`, '')
   const status = didAgree
     ? `✅ Full agreement after ${rounds} round(s)`
@@ -530,4 +532,70 @@ export function buildCommentBody(syn: SynthesisLike, audit: CitationAuditLike | 
 
   L.push('---', '<sub>🤖 Posted by `/adversarial-review`. Confirmed = both models agree AND every cited file:line was checked and resolves; “unverified” = agreed but the citation is missing, isn’t a file:line, or didn’t resolve — re-check manually; disputed = stable disagreement for a human.</sub>')
   return L.join('\n')
+}
+
+// ─── Blind round-1 review rendering (anchoring fix) ──────────────────────────
+
+export interface BlindFinding { finding?: string; citation?: string; severity?: string }
+export interface BlindReview { findings?: BlindFinding[]; cleanAssessment?: string }
+
+/** Render the blind Claude round-1 review compactly for the debate history:
+ *  one bullet per finding (`finding (citation) [severity]`), or the
+ *  cleanAssessment when the findings list is empty. Tolerates missing fields —
+ *  the schema requires them, but the agent's output is untrusted transport. */
+export function renderBlindReview(blind: BlindReview | null | undefined): string {
+  const findings = (blind && Array.isArray(blind.findings) ? blind.findings : []).filter((f) => f && f.finding)
+  if (!findings.length) {
+    const assessment = blind && typeof blind.cleanAssessment === 'string' && blind.cleanAssessment.trim()
+      ? blind.cleanAssessment.trim()
+      : 'clean — no assessment provided'
+    return `BLIND REVIEW — no findings. ${assessment}`
+  }
+  return findings
+    .map((f) => `• ${f.finding}${f.citation ? ` (${f.citation})` : ''}${f.severity ? ` [${f.severity}]` : ''}`)
+    .join('\n')
+}
+
+// ─── Post-synthesis refuter pass (shared-hallucination fix) ──────────────────
+
+/** Pick which agreed findings get a fresh-context refuter when there are more
+ *  than `cap`: the top `cap` by severity rank (critical first; unknown
+ *  severities last), ties broken by original position. Returns ORIGINAL
+ *  indices in ascending order so refuter results map back positionally. */
+export function selectRefutationIndices(findings: Array<{ severity?: string }>, cap: number): number[] {
+  const idx = (findings || []).map((_, i) => i)
+  if (idx.length <= cap) return idx
+  return idx
+    .map((i) => ({ i, rank: SEV_RANK[findings[i]?.severity ?? ''] ?? 9 }))
+    .sort((a, b) => a.rank - b.rank || a.i - b.i)
+    .slice(0, cap)
+    .map((x) => x.i)
+    .sort((a, b) => a - b)
+}
+
+export interface Refutation { refuted?: boolean; reasoning?: string; confidence?: string }
+
+/** Apply refuter verdicts to the agreed findings. `refutations` is
+ *  POSITIONALLY parallel to `agreedFindings` (null = no refuter ran for that
+ *  finding — capped out or agent failure — which KEEPS the finding
+ *  un-annotated: the refuter is an EXTRA gate, so it fails OPEN).
+ *  - refuted:true at high/medium confidence → the finding moves OUT of the
+ *    kept set into `refuted` (with the refuter's reasoning).
+ *  - refuted:true at low (or unrecognized) confidence → kept, annotated with
+ *    `refuterNote: reasoning` so a human sees the doubt.
+ *  - refuted:false (or malformed) → kept unchanged. */
+export function applyRefutations<T extends object>(
+  agreedFindings: T[],
+  refutations: Array<Refutation | null | undefined>,
+): { kept: Array<T & { refuterNote?: string }>; refuted: Array<{ finding: T; reasoning: string }> } {
+  const kept: Array<T & { refuterNote?: string }> = []
+  const refuted: Array<{ finding: T; reasoning: string }> = []
+  ;(agreedFindings || []).forEach((f, i) => {
+    const r = refutations ? refutations[i] : null
+    if (!r || r.refuted !== true) { kept.push(f); return }
+    const reasoning = typeof r.reasoning === 'string' ? r.reasoning : ''
+    if (r.confidence === 'high' || r.confidence === 'medium') refuted.push({ finding: f, reasoning })
+    else kept.push({ ...f, refuterNote: reasoning })
+  })
+  return { kept, refuted }
 }

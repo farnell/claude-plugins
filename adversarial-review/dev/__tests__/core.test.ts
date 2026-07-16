@@ -467,6 +467,14 @@ describe('decideResumeAction', () => {
     expect(core.decideResumeAction(st({ history: [claude('c'), codex('reply')] }), { maxRounds: 3, humanAnswer: null }))
       .toEqual({ action: 'proceed' })
   })
+  it('proceed when the last turn is the blind Claude review — claude-blind is NOT the critique agent', () => {
+    // Fresh states never end this way (a save only happens after a critique or
+    // codex turn), but the vector pins the semantics: the special-casing of
+    // agent === 'claude' must not swallow 'claude-blind'.
+    const blind = { agent: 'claude-blind', round: 1, content: '• finding (a.ts:5) [high]' }
+    expect(core.decideResumeAction(st({ history: [codex('r1', 1), blind] }), { maxRounds: 3, humanAnswer: null }))
+      .toEqual({ action: 'proceed' })
+  })
   it('proceed when the last turn is a human answer', () => {
     expect(core.decideResumeAction(st({ history: [claude('[ASKED HUMAN] Q?'), human('Human answer to the open question: yes')] }), { maxRounds: 3, humanAnswer: null }))
       .toEqual({ action: 'proceed' })
@@ -616,8 +624,9 @@ describe('buildCommentBody', () => {
   }
 
   it('carries the marker, status counts, and fail-closed confirmed/unverified buckets', () => {
-    const body = core.buildCommentBody(syn, audit, true, 2, false)
+    const body = core.buildCommentBody(syn, audit, true, 2, false, 'gpt-5.6-sol')
     expect(body).toContain(core.COMMENT_MARKER)
+    expect(body).toContain('## 🔬 Adversarial review — Codex (gpt-5.6-sol) × Claude')
     expect(body).toContain('✅ Full agreement after 2 round(s)')
     expect(body).toContain('**1** confirmed · **1** unverified · **1** disputed')
     // confirmed section lists the resolving finding; unresolved bucket the other
@@ -627,13 +636,13 @@ describe('buildCommentBody', () => {
     expect(body).toContain('1. do x first')
   })
   it('audit caveat is checkout-relative when auditedPrHead=false (keeps the not-on-this-branch excuse)', () => {
-    const body = core.buildCommentBody(syn, audit, true, 2, false)
+    const body = core.buildCommentBody(syn, audit, true, 2, false, 'm')
     expect(body).toContain('did not resolve against the current checkout')
     expect(body).toContain('not on this branch')
     expect(body).not.toContain('PR head')
   })
   it('audit caveat says PR head when auditedPrHead=true — the branch-mismatch excuse disappears', () => {
-    const body = core.buildCommentBody(syn, audit, true, 2, true)
+    const body = core.buildCommentBody(syn, audit, true, 2, true, 'm')
     expect(body).toContain('did not resolve against the PR head')
     expect(body).not.toContain('not on this branch')
     expect(body).not.toContain('current checkout')
@@ -641,15 +650,118 @@ describe('buildCommentBody', () => {
   it('no audit caveat when everything resolved (either locus)', () => {
     const clean: core.CitationAuditLike = { checked: 1, unresolved: 0, badRefs: [], results: [{ ref: 'a.ts:5', status: 'ok' }] }
     for (const flag of [true, false]) {
-      const body = core.buildCommentBody(syn, clean, false, 3, flag)
+      const body = core.buildCommentBody(syn, clean, false, 3, flag, 'm')
       expect(body).toContain('⚠️ 3 round(s), no full agreement')
       expect(body).not.toContain('did not resolve')
     }
   })
   it('tolerates an empty synthesis and a missing audit (everything unverified, no caveat)', () => {
-    const body = core.buildCommentBody({}, undefined, false, 0, false)
+    const body = core.buildCommentBody({}, undefined, false, 0, false, 'm')
     expect(body).toContain('_None._')
     expect(body).toContain('**0** confirmed · **0** unverified · **0** disputed')
+  })
+})
+
+// ─── renderBlindReview (blind round-1 → history text) ────────────────────────
+describe('renderBlindReview', () => {
+  it('renders findings as compact bullets: finding (citation) [severity]', () => {
+    const out = core.renderBlindReview({
+      findings: [
+        { finding: 'off-by-one in pager', citation: 'src/p.ts:42', severity: 'high' },
+        { finding: 'stale TODO', citation: 'docs/r.md:7', severity: 'low' },
+      ],
+      cleanAssessment: 'ignored when findings exist',
+    })
+    expect(out).toBe('• off-by-one in pager (src/p.ts:42) [high]\n• stale TODO (docs/r.md:7) [low]')
+  })
+  it('falls back to the cleanAssessment when findings are empty', () => {
+    expect(core.renderBlindReview({ findings: [], cleanAssessment: 'All five categories clean.' }))
+      .toBe('BLIND REVIEW — no findings. All five categories clean.')
+  })
+  it('tolerates missing fields (untrusted agent output)', () => {
+    expect(core.renderBlindReview({ findings: [{ finding: 'x' }] } as any)).toBe('• x')
+    expect(core.renderBlindReview({ findings: [{ citation: 'a.ts:1' } as any], cleanAssessment: '' }))
+      .toBe('BLIND REVIEW — no findings. clean — no assessment provided')
+    expect(core.renderBlindReview(null)).toBe('BLIND REVIEW — no findings. clean — no assessment provided')
+    expect(core.renderBlindReview({} as any)).toBe('BLIND REVIEW — no findings. clean — no assessment provided')
+  })
+})
+
+// ─── selectRefutationIndices (refuter cap: top-N by severity, no silent drop) ─
+describe('selectRefutationIndices', () => {
+  const f = (severity?: string) => ({ severity })
+  it('returns all indices when at or under the cap', () => {
+    expect(core.selectRefutationIndices([f('low'), f('high')], 12)).toEqual([0, 1])
+    expect(core.selectRefutationIndices([f('low'), f('high')], 2)).toEqual([0, 1])
+    expect(core.selectRefutationIndices([], 12)).toEqual([])
+  })
+  it('over the cap: keeps the most severe, ties broken by original position, output ascending', () => {
+    const findings = [f('low'), f('critical'), f('medium'), f('high'), f('low')]
+    expect(core.selectRefutationIndices(findings, 3)).toEqual([1, 2, 3])
+  })
+  it('unknown severities rank last', () => {
+    const findings = [f('weird'), f(undefined), f('low'), f('critical')]
+    expect(core.selectRefutationIndices(findings, 2)).toEqual([2, 3])
+  })
+  it('same-severity ties keep earlier findings', () => {
+    const findings = [f('high'), f('high'), f('high')]
+    expect(core.selectRefutationIndices(findings, 2)).toEqual([0, 1])
+  })
+})
+
+// ─── applyRefutations (fail-open extra gate over agreed findings) ────────────
+describe('applyRefutations', () => {
+  const F = (finding: string) => ({ finding, severity: 'high', citation: 'a.ts:1' })
+  it('high/medium-confidence refutations move the finding out; reasoning travels with it', () => {
+    const { kept, refuted } = core.applyRefutations(
+      [F('a'), F('b'), F('c')],
+      [
+        { refuted: true, reasoning: 'source says otherwise', confidence: 'high' },
+        { refuted: true, reasoning: 'line 9 contradicts', confidence: 'medium' },
+        { refuted: false, reasoning: 'holds up', confidence: 'high' },
+      ],
+    )
+    expect(kept).toEqual([F('c')])
+    expect(refuted).toEqual([
+      { finding: F('a'), reasoning: 'source says otherwise' },
+      { finding: F('b'), reasoning: 'line 9 contradicts' },
+    ])
+  })
+  it('a low-confidence refutation keeps the finding but annotates it with refuterNote', () => {
+    const { kept, refuted } = core.applyRefutations([F('a')], [{ refuted: true, reasoning: 'maybe wrong', confidence: 'low' }])
+    expect(refuted).toEqual([])
+    expect(kept).toEqual([{ ...F('a'), refuterNote: 'maybe wrong' }])
+  })
+  it('a null refutation (agent skipped/failed or capped out) keeps the finding UN-annotated — fail open', () => {
+    const { kept, refuted } = core.applyRefutations([F('a'), F('b')], [null, undefined])
+    expect(kept).toEqual([F('a'), F('b')])
+    expect(kept[0]).not.toHaveProperty('refuterNote')
+    expect(refuted).toEqual([])
+  })
+  it('refuted:true with a missing/unrecognized confidence downgrades to keep+annotate (fail open)', () => {
+    const { kept, refuted } = core.applyRefutations(
+      [F('a'), F('b')],
+      [{ refuted: true, reasoning: 'r1' }, { refuted: true, reasoning: 'r2', confidence: 'certain' }],
+    )
+    expect(refuted).toEqual([])
+    expect(kept).toEqual([{ ...F('a'), refuterNote: 'r1' }, { ...F('b'), refuterNote: 'r2' }])
+  })
+  it('refuted:false keeps the finding clean regardless of confidence; non-string reasoning reads as empty', () => {
+    const { kept } = core.applyRefutations(
+      [F('a'), F('b')],
+      [{ refuted: false, reasoning: 'fine', confidence: 'low' }, { refuted: true, confidence: 'low' } as any],
+    )
+    expect(kept[0]).toEqual(F('a'))
+    expect(kept[1]).toEqual({ ...F('b'), refuterNote: '' })
+  })
+  it('short refutations array leaves the tail kept (positional parallel)', () => {
+    const { kept, refuted } = core.applyRefutations([F('a'), F('b')], [{ refuted: true, reasoning: 'ev', confidence: 'high' }])
+    expect(kept).toEqual([F('b')])
+    expect(refuted).toEqual([{ finding: F('a'), reasoning: 'ev' }])
+  })
+  it('tolerates empty/undefined inputs', () => {
+    expect(core.applyRefutations([], [])).toEqual({ kept: [], refuted: [] })
+    expect(core.applyRefutations([F('a')], undefined as any)).toEqual({ kept: [F('a')], refuted: [] })
   })
 })
 
@@ -667,7 +779,7 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
 
   it('inline helpers behave identically to core for every vector', () => {
     const inline: any = new Function(
-      `${block}\n;return { parseArgs, validateTarget, shortHash, makeStateKey, shq, parseCodex, codexLaunchCmd, codexPollCmd, codexHarvestCmd, shouldRetryCodex, agreementProblem, buildCritique, decideResumeAction, checkStaleness, COMMENT_MARKER, heredocDelim, splitFindingsByCitation, summarizeAudit, postCommentScript, buildCommentBody };`
+      `${block}\n;return { parseArgs, validateTarget, shortHash, makeStateKey, shq, parseCodex, codexLaunchCmd, codexPollCmd, codexHarvestCmd, shouldRetryCodex, agreementProblem, buildCritique, decideResumeAction, checkStaleness, COMMENT_MARKER, heredocDelim, splitFindingsByCitation, summarizeAudit, postCommentScript, buildCommentBody, renderBlindReview, selectRefutationIndices, applyRefutations };`
     )()
 
     const argVectors = [{ target: '249', maxRounds: 3 }, '{"target":"249","resume":true}', 'docs/x.md', '{bad', undefined]
@@ -754,6 +866,8 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
       [{ target: '242', history: [cl('critique')], codexSessionId: null, round: 3, pausedReason: 'needs_approval' }, { maxRounds: 3, humanAnswer: null }],
       [{ target: '242', history: [cl('c'), cx('reply')], codexSessionId: SID, round: 3, pausedReason: 'codex_failed' }, { maxRounds: 3, humanAnswer: null }],
       [{ target: '242', history: [], codexSessionId: SID, round: 0, pausedReason: undefined }, { maxRounds: 3, humanAnswer: null }],
+      // history ending in the blind round-1 entry → proceed (claude-blind ≠ claude)
+      [{ target: '242', history: [cx('r1'), { agent: 'claude-blind', round: 1, content: '• f (a.ts:5) [high]' }], codexSessionId: SID, round: 0, pausedReason: undefined }, { maxRounds: 3, humanAnswer: null }],
     ]
     for (const [s, o] of resumeVectors) expect(inline.decideResumeAction(s, o)).toEqual(core.decideResumeAction(s, o))
 
@@ -801,12 +915,51 @@ describe('workflow inline helpers mirror core.ts (drift guard)', () => {
       checked: 2, unresolved: 1, badRefs: ['b.ts:9'],
       results: [{ ref: 'a.ts:5', status: 'ok' }, { ref: 'b.ts:9', status: 'nofile' }],
     }
-    const commentVectors: Array<[any, any, boolean, number, boolean]> = [
-      [synV, auditV, true, 2, false],
-      [synV, auditV, true, 2, true],
-      [synV, { checked: 1, unresolved: 0, badRefs: [], results: [{ ref: 'a.ts:5', status: 'ok' }] }, false, 3, true],
-      [{}, undefined, false, 0, false],
+    const commentVectors: Array<[any, any, boolean, number, boolean, string]> = [
+      [synV, auditV, true, 2, false, 'gpt-5.6-sol'],
+      [synV, auditV, true, 2, true, 'gpt-5.6-sol'],
+      [synV, { checked: 1, unresolved: 0, badRefs: [], results: [{ ref: 'a.ts:5', status: 'ok' }] }, false, 3, true, 'some-other-model'],
+      [{}, undefined, false, 0, false, ''],
     ]
-    for (const [sy, au, ag, ro, ph] of commentVectors) expect(inline.buildCommentBody(sy, au, ag, ro, ph)).toBe(core.buildCommentBody(sy, au, ag, ro, ph))
+    for (const [sy, au, ag, ro, ph, mn] of commentVectors) expect(inline.buildCommentBody(sy, au, ag, ro, ph, mn)).toBe(core.buildCommentBody(sy, au, ag, ro, ph, mn))
+
+    // renderBlindReview (blind round-1 → history text)
+    const blindVectors = [
+      { findings: [{ finding: 'f1', citation: 'a.ts:5', severity: 'high' }, { finding: 'f2', citation: 'b.md:9', severity: 'low' }], cleanAssessment: 'x' },
+      { findings: [], cleanAssessment: 'All categories clean.' },
+      { findings: [{ finding: 'no cite or sev' }], cleanAssessment: '' },
+      { findings: [{ citation: 'orphan.ts:1' }], cleanAssessment: '' },
+      null,
+      {},
+    ]
+    for (const v of blindVectors) expect(inline.renderBlindReview(v as any)).toBe(core.renderBlindReview(v as any))
+
+    // selectRefutationIndices (refuter cap by severity)
+    const sevVectors: Array<[Array<{ severity?: string }>, number]> = [
+      [[{ severity: 'low' }, { severity: 'high' }], 12],
+      [[{ severity: 'low' }, { severity: 'critical' }, { severity: 'medium' }, { severity: 'high' }, { severity: 'low' }], 3],
+      [[{ severity: 'weird' }, {}, { severity: 'low' }, { severity: 'critical' }], 2],
+      [[{ severity: 'high' }, { severity: 'high' }, { severity: 'high' }], 2],
+      [[], 12],
+    ]
+    for (const [f2, c2] of sevVectors) expect(inline.selectRefutationIndices(f2, c2)).toEqual(core.selectRefutationIndices(f2, c2))
+
+    // applyRefutations (fail-open extra gate)
+    const fx = (finding: string) => ({ finding, severity: 'high', citation: 'a.ts:1' })
+    const refuteVectors: Array<[any[], any]> = [
+      [[fx('a'), fx('b'), fx('c')], [
+        { refuted: true, reasoning: 'contra', confidence: 'high' },
+        { refuted: true, reasoning: 'contra2', confidence: 'medium' },
+        { refuted: false, reasoning: 'ok', confidence: 'high' },
+      ]],
+      [[fx('a')], [{ refuted: true, reasoning: 'doubt', confidence: 'low' }]],
+      [[fx('a'), fx('b')], [null, undefined]],
+      [[fx('a')], [{ refuted: true, reasoning: 'no conf' }]],
+      [[fx('a')], [{ refuted: true, confidence: 'low' }]],
+      [[fx('a'), fx('b')], [{ refuted: true, reasoning: 'ev', confidence: 'high' }]],
+      [[], []],
+      [[fx('a')], undefined],
+    ]
+    for (const [f3, r3] of refuteVectors) expect(inline.applyRefutations(f3, r3)).toEqual(core.applyRefutations(f3, r3))
   })
 })
