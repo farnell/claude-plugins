@@ -1,6 +1,6 @@
 # claude-plugins
 
-A small marketplace of [Claude Code](https://docs.claude.com/en/docs/claude-code) tools. Currently one: **adversarial-review** — a Claude × Codex code reviewer.
+A small marketplace of [Claude Code](https://docs.claude.com/en/docs/claude-code) tools: **adversarial-review** — a Claude × Codex code reviewer — and **ralph** — a PR pipeline that grinds a roadmap doc into merged PRs.
 
 ---
 
@@ -142,3 +142,18 @@ For a **workflow-only** change you can skip all of it and pull the engine straig
 ## License
 
 [MIT](LICENSE)
+
+## ralph
+
+Grinds a feature/roadmap markdown file into merged PRs, one per task: red tests → implement →
+check → Opus review → scripted merge, each stage a fresh agent in its own worktree. All state
+lives on GitHub (the ledger on `main` + marker comments on each PR), so a killed run resumes from
+any session. One core for every repo; each repo adds a small adapter (`.claude/ralph.json`).
+
+```
+/plugin install ralph@farnell-plugins
+/ralph --init                 # once per repo: adapter + policy addendum + known-flakes list
+/ralph docs/my-roadmap.md     # derive the ledger, land it, grind
+```
+
+Details: [`ralph/README.md`](ralph/README.md) · adapter reference: [`ralph/docs/adapter.md`](ralph/docs/adapter.md).

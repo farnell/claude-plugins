@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Force this machine's Claude Code install of adversarial-review to match the
-# latest committed release — bypassing the version-gated `/plugin update` flow.
+# Force this machine's Claude Code install of a farnell-plugins plugin
+# (adversarial-review by default, or the one named) to match the latest committed release — bypassing the version-gated `/plugin update` flow.
 #
 # WHY THIS EXISTS
 #   Merging a release to `main` does NOT update any local copy. Claude Code
@@ -15,10 +15,10 @@
 #   (re)build the cache dir for the released version, repoint installed_plugins.json,
 #   and sync the live engine. Idempotent; safe to run anytime.
 #
-# USAGE:  scripts/sync-local.sh        # after merging a release to main
+# USAGE:  scripts/sync-local.sh [plugin]   # after merging a release to main (default: adversarial-review)
 set -euo pipefail
 
-PLUGIN="adversarial-review"
+PLUGIN="${1:-adversarial-review}"
 MKT="farnell-plugins"
 CLONE="$HOME/.claude/plugins/marketplaces/$MKT"
 CACHE_BASE="$HOME/.claude/plugins/cache/$MKT/$PLUGIN"
@@ -67,9 +67,13 @@ else
   echo "  (no installed_plugins.json — skipping the version record; the engine is still synced below)"
 fi
 
-echo "→ syncing live engine (what the SessionStart hook does on session start)"
-mkdir -p "$HOME/.claude/workflows"
-cp -f "$DST/workflows/$PLUGIN.js" "$LIVE"
+# adversarial-review's engine is copied to ~/.claude/workflows by its SessionStart hook;
+# a plugin whose workflow resolves natively (ralph: `ralph:ralph-loop`) has no live copy.
+if [ -f "$DST/hooks/hooks.json" ] && grep -q "workflows/$PLUGIN.js" "$DST/hooks/hooks.json"; then
+  echo "→ syncing live engine (what the SessionStart hook does on session start)"
+  mkdir -p "$HOME/.claude/workflows"
+  cp -f "$DST/workflows/$PLUGIN.js" "$LIVE"
+  echo "  live engine: $LIVE"
+fi
 
 echo "✓ synced $PLUGIN → v$VER  (${SHA:0:7})"
-echo "  live engine: $LIVE"
