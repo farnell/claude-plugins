@@ -25,6 +25,8 @@ intelligence is per stage.
 
 ## Install
 
+Needs **Node ≥ 22.18** (native TypeScript type stripping: every helper runs as plain `node`).
+
 ```
 /plugin marketplace add farnell/claude-plugins
 /plugin install ralph@farnell-plugins
