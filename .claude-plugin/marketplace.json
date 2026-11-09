@@ -1,6 +1,6 @@
 {
   "name": "farnell-plugins",
-  "description": "Matt Farnell's personal Claude Code tools. Currently: adversarial-review (Claude × Codex code review).",
+  "description": "Matt Farnell's personal Claude Code tools: adversarial-review (Claude × Codex code review) and ralph (the PR pipeline grinder).",
   "owner": {
     "name": "Matt Farnell",
     "email": "mfarnell@gmail.com"
@@ -11,6 +11,12 @@
       "source": "./adversarial-review",
       "description": "Adversarial Claude + Codex code review of a markdown file or GitHub PR — blind parallel first pass, up to N debate rounds, machine-verified citations, and a fresh-context refuter pass over every agreed finding. Resumable from disk.",
       "version": "1.2.0"
+    },
+    {
+      "name": "ralph",
+      "source": "./ralph",
+      "description": "Ralph PR pipeline: grind a feature/roadmap doc into merged PRs, one per task — red tests, implement, check, Opus review, scripted merge — each stage a fresh agent in its own worktree, all state on GitHub so any session resumes. One core; each repo adds a small adapter (.claude/ralph.json).",
+      "version": "1.0.0"
     }
   ]
 }

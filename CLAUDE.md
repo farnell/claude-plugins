@@ -1,6 +1,8 @@
 # CLAUDE.md — claude-plugins
 
-Personal Claude Code marketplace. One plugin today: **adversarial-review** (a Claude × Codex code reviewer implemented as a Workflow).
+Personal Claude Code marketplace. Two plugins: **adversarial-review** (a Claude × Codex code reviewer implemented as a Workflow) and **ralph** (the PR pipeline grinder; `ralph/README.md`).
+
+**ralph is simpler to ship than adversarial-review:** its workflow resolves natively as `ralph:ralph-loop` (no SessionStart copy, no live engine), and its helpers run from the plugin dir with plain `node` (the skill passes `${CLAUDE_PLUGIN_ROOT}` to the workflow as `ralphRoot`). So after a merge, `scripts/sync-local.sh ralph` (or a restart once the cache advances) is all an update needs. Every repo-specific fact lives in that repo's `.claude/ralph.json` + addendum — **never add a repo's names, hosts or commands to `ralph/`** (this repo is public; `ralph-loop-workflow.test.ts` pins the workflow to repo-neutral text). The version gate below applies to every plugin in `marketplace.json`.
 
 ## Mental model (read before "just update it")
 
@@ -30,7 +32,7 @@ Supported-but-flaky TUI path (documented for completeness): `/plugin` → Market
 ## Releasing a change (maintainer)
 
 1. Edit files under `adversarial-review/` (the workflow engine `workflows/adversarial-review.js` ships bundled — a workflow change releases like any other).
-2. **Bump `version` in BOTH** `adversarial-review/.claude-plugin/plugin.json` and the `adversarial-review` entry in `.claude-plugin/marketplace.json` (keep them equal). Updates are version-gated; an un-bumped push is invisible.
+2. **Bump `version` in BOTH** `<plugin>/.claude-plugin/plugin.json` and its entry in `.claude-plugin/marketplace.json` (keep them equal). Updates are version-gated; an un-bumped push is invisible.
    - A tracked `pre-push` hook (`.githooks/pre-push`, active after `npm install`) blocks a push to `main` that changes `adversarial-review/` content without a bump, and blocks a version mismatch. A vitest test asserts the two versions stay equal.
    - The gate scopes to `adversarial-review/` **excluding `adversarial-review/dev/`**. Changes to `README.md`, this `CLAUDE.md`, or `scripts/` are outside the plugin and **do not need a bump**.
 3. `npm test` (drift guard + manifest-version). Optionally `claude plugin validate ./adversarial-review && claude plugin validate .`.

@@ -7,24 +7,23 @@
 # is invisible to every installed user — including you. This hook refuses
 # such a push to `main` before it can silently ship nothing.
 #
-# It also enforces that the two version fields stay equal:
-#   adversarial-review/.claude-plugin/plugin.json  -> .version
-#   .claude-plugin/marketplace.json                -> plugins[name==adversarial-review].version
+# It also enforces that, for EVERY plugin in the catalog, the two version fields stay equal:
+#   <plugin>/.claude-plugin/plugin.json  -> .version
+#   .claude-plugin/marketplace.json      -> plugins[name==<plugin>].version
 #
 # Scope: only pushes to refs/heads/main are guarded; feature branches push freely.
-# Dev-only files (adversarial-review/dev/**) and repo tooling don't count as
-# plugin content. Bypass in a pinch with:  git push --no-verify
+# Dev-only files (<plugin>/dev/**) and repo tooling don't count as plugin
+# content. Bypass in a pinch with:  git push --no-verify
 #
 # Activate (once per clone):  git config core.hooksPath .githooks
 
-plugin="adversarial-review"
-manifest="$plugin/.claude-plugin/plugin.json"
 catalog=".claude-plugin/marketplace.json"
 protected="refs/heads/main"
 zero="0000000000000000000000000000000000000000"
 
-ver_plugin()  { git show "$1:$manifest" 2>/dev/null | jq -r '.version // empty' 2>/dev/null; }
-ver_catalog() { git show "$1:$catalog"  2>/dev/null | jq -r --arg n "$plugin" '.plugins[] | select(.name==$n) | .version // empty' 2>/dev/null; }
+ver_plugin()  { git show "$1:$2/.claude-plugin/plugin.json" 2>/dev/null | jq -r '.version // empty' 2>/dev/null; }
+ver_catalog() { git show "$1:$catalog" 2>/dev/null | jq -r --arg n "$2" '.plugins[] | select(.name==$n) | .version // empty' 2>/dev/null; }
+plugins_at()  { git show "$1:$catalog" 2>/dev/null | jq -r '.plugins[].name' 2>/dev/null; }
 
 status=0
 while read -r _local_ref local_sha remote_ref remote_sha; do
@@ -38,37 +37,40 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
   fi
   [ -n "$base" ] || continue                     # nothing to diff against — allow
 
-  # Did published plugin content change (ignoring dev-only files)?
-  if git diff --quiet "$base" "$local_sha" -- "$plugin" ":(exclude)$plugin/dev"; then
-    continue                                      # no plugin change — nothing to gate
-  fi
+  for plugin in $(plugins_at "$local_sha"); do
+    manifest="$plugin/.claude-plugin/plugin.json"
+    # Did published plugin content change (ignoring dev-only files)?
+    if git diff --quiet "$base" "$local_sha" -- "$plugin" ":(exclude)$plugin/dev"; then
+      continue                                      # no plugin change — nothing to gate
+    fi
 
-  old="$(ver_plugin "$base")"
-  new="$(ver_plugin "$local_sha")"
-  if [ -z "$new" ]; then
-    echo "✗ pre-push blocked: can't read version from $manifest at the pushed commit." >&2
-    status=1; continue
-  fi
-  if [ "$old" = "$new" ]; then
-    echo "✗ pre-push blocked: $plugin/ changed but version is still $new." >&2
-    echo "  Updates are version-gated — an un-bumped push ships nothing to users." >&2
-    echo "  Bump 'version' in BOTH:" >&2
-    echo "    $manifest" >&2
-    echo "    $catalog" >&2
-    echo "  then commit. (Override with: git push --no-verify)" >&2
-    status=1; continue
-  fi
+    old="$(ver_plugin "$base" "$plugin")"
+    new="$(ver_plugin "$local_sha" "$plugin")"
+    if [ -z "$new" ]; then
+      echo "✗ pre-push blocked: can't read version from $manifest at the pushed commit." >&2
+      status=1; continue
+    fi
+    if [ "$old" = "$new" ]; then
+      echo "✗ pre-push blocked: $plugin/ changed but version is still $new." >&2
+      echo "  Updates are version-gated — an un-bumped push ships nothing to users." >&2
+      echo "  Bump 'version' in BOTH:" >&2
+      echo "    $manifest" >&2
+      echo "    $catalog" >&2
+      echo "  then commit. (Override with: git push --no-verify)" >&2
+      status=1; continue
+    fi
 
-  cat_new="$(ver_catalog "$local_sha")"
-  if [ "$cat_new" != "$new" ]; then
-    echo "✗ pre-push blocked: version mismatch at the pushed commit —" >&2
-    echo "    $manifest  = $new" >&2
-    echo "    $catalog   = ${cat_new:-<missing>}" >&2
-    echo "  Set both to the same version, then commit. (Override: git push --no-verify)" >&2
-    status=1; continue
-  fi
+    cat_new="$(ver_catalog "$local_sha" "$plugin")"
+    if [ "$cat_new" != "$new" ]; then
+      echo "✗ pre-push blocked: version mismatch at the pushed commit —" >&2
+      echo "    $manifest  = $new" >&2
+      echo "    $catalog   = ${cat_new:-<missing>}" >&2
+      echo "  Set both to the same version, then commit. (Override: git push --no-verify)" >&2
+      status=1; continue
+    fi
 
-  echo "✓ pre-push: $plugin version $old → $new (catalog in sync)" >&2
+    echo "✓ pre-push: $plugin version ${old:-<new>} → $new (catalog in sync)" >&2
+  done
 done
 
 exit "$status"
