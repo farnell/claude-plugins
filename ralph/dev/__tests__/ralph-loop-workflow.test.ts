@@ -34,7 +34,7 @@ const ADAPTER = {
   addendum: "docs/ralph/repo-policy.md",
   knownFlakes: "docs/ralph/known-flakes.md",
   worktreeSetup: ["pnpm install --frozen-lockfile --prefer-offline"],
-  commands: { typecheck: "pnpm typecheck", testFiles: "pnpm vitest run", mergeGate: "pnpm test" },
+  commands: { typecheck: "pnpm typecheck", testFiles: "pnpm vitest run", mergeGate: "pnpm run test" },
   merge: {
     note: "it deploys to staging; prod moves only at release.",
     guard: "node src/ralph/migration-additive.ts --pr {pr}",
@@ -360,7 +360,7 @@ describe("ralph-loop workflow plumbing (2026-10-12 lessons)", () => {
   it("the merge agent's gate, guard, CI wait and deploy note all come from the adapter", async () => {
     const { calls } = await runWorkflow([{ stage: "merge" }]);
     const prompt = calls.find((c) => c.opts.label === "ralph:T1:merge")!.prompt;
-    expect(prompt).toContain("MERGE GATE (TYPECHECK + `pnpm test`)");
+    expect(prompt).toContain("MERGE GATE (TYPECHECK + `pnpm run test`)");
     expect(prompt).toContain("TYPECHECK: `pnpm typecheck`");
     expect(prompt).toContain("`node src/ralph/migration-additive.ts --pr <n>`");
     expect(prompt).toMatch(/ok=false \(or fails\), do NOT merge/);
@@ -391,6 +391,13 @@ describe("ralph-loop workflow plumbing (2026-10-12 lessons)", () => {
     });
     expect(result.status).toBe("migration-pending");
     expect(result.message).toBe("T1 merged migration drizzle/0210_x.sql: apply it (pnpm db:migrate), then re-run /ralph");
+  });
+
+  it("a scripted merge that read afterMigration:stop stops the run even if the preflight copy said continue", async () => {
+    const { result } = await runWorkflow([{ stage: "merge", remaining: 2 }, { stage: "red", remaining: 1 }], {
+      scriptedMerge: { ok: true, error: "", status: "merged", sha: "abc", migrationAdded: "drizzle/0210_x.sql", afterMigration: "stop", message: "PR #5 squash-merged" },
+    });
+    expect(result.status).toBe("migration-pending");
   });
 
   it("the workflow itself names no repo: every repo fact comes from the adapter", () => {

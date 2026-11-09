@@ -38,7 +38,7 @@ export interface Adapter {
     typecheck: string;
     /** run named test files: the files are appended, e.g. "pnpm vitest run" */
     testFiles: string;
-    /** the merge gate's full test run, e.g. "pnpm test" */
+    /** the merge gate's full test run, e.g. "pnpm run test" (not "pnpm test": see parseAdapter) */
     mergeGate: string;
   };
   merge: {
@@ -123,6 +123,11 @@ export function parseAdapter(raw: unknown): Adapter {
   need("commands.mergeGate", c.mergeGate);
   const m = { ...DEFAULTS.merge, ...((o.merge ?? {}) as Record<string, unknown>) } as Record<string, any>;
   need("merge.note", m.note);
+  // `pnpm test` / `npm test` are package-manager built-ins: they parse the vitest reporter flags the
+  // scripted merge appends as their OWN options and exit before vitest runs (pnpm: "Unknown option").
+  if (m.vitestJson !== false && isStr(c.mergeGate) && /^\s*(pnpm|npm)\s+test(\s|$)/.test(c.mergeGate)) {
+    errs.push(`"commands.mergeGate" "${c.mergeGate}" swallows the vitest reporter flags; use "${c.mergeGate.trim().replace(/^(pnpm|npm)\s+test/, "$1 run test")}" (or set merge.vitestJson false)`);
+  }
   if (m.afterMigration !== "continue" && m.afterMigration !== "stop") errs.push(`"merge.afterMigration" must be "continue" or "stop"`);
   for (const k of ["guard", "gateWrapper", "migrationMessage", "lockfile", "install"]) {
     if (!isStr(m[k])) errs.push(`"merge.${k}" must be a string`);

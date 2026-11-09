@@ -56,6 +56,9 @@ export interface MergeResult {
   failedFiles: string[];
   /** guardrail only: why the guard refused. */
   guardReasons: string[];
+  /** The adapter's merge.afterMigration, read from .claude/ralph.json by this script, so the
+   *  workflow's stop-after-migration never depends on an agent copying the adapter. */
+  afterMigration: "continue" | "stop";
   /** Plain one-line explanation for the run log and the fallback agent. */
   message: string;
   /** Tail of the failing command's output (red / error), "" otherwise. */
@@ -93,7 +96,9 @@ const both = (o: RunOut) => `${tail(o.stderr)}\n--- stdout ---\n${tail(o.stdout)
 function result(status: MergeStatus, fields: Partial<MergeResult>): MergeResult {
   return {
     status, sha: "", migrationAdded: "", typecheckFailed: false, ciFailed: false, failedFiles: [], guardReasons: [],
-    message: "", detail: "", ...fields,
+    // "stop" until runMerge stamps the adapter's real value: a result with no adapter behind it
+    // (it failed to load) must never let a run carry on past a merged migration.
+    afterMigration: "stop", message: "", detail: "", ...fields,
   };
 }
 
@@ -154,7 +159,11 @@ export const CI_POLL_MS = 20_000;
 /** A PR whose head has no checks after this long has no CI to wait for. */
 export const CI_NONE_AFTER_MS = 120_000;
 
-export async function runMerge({ pr, branch, ledger, task }: MergeTarget, deps: MergeDeps): Promise<MergeResult> {
+export async function runMerge(target: MergeTarget, deps: MergeDeps): Promise<MergeResult> {
+  return { ...(await mergeOnce(target, deps)), afterMigration: deps.adapter.merge.afterMigration };
+}
+
+async function mergeOnce({ pr, branch, ledger, task }: MergeTarget, deps: MergeDeps): Promise<MergeResult> {
   const { run, sh, adapter } = deps;
   const m = adapter.merge;
   const must = (o: RunOut, what: string): MergeResult | null =>

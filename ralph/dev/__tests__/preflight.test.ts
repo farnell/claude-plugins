@@ -69,7 +69,7 @@ const ADAPTER = parseAdapter({
   repo: "acme/app",
   addendum: "docs/ralph/repo-policy.md",
   installProbe: "pnpm exec vitest --version",
-  commands: { typecheck: "pnpm typecheck", testFiles: "pnpm vitest run", mergeGate: "pnpm test" },
+  commands: { typecheck: "pnpm typecheck", testFiles: "pnpm vitest run", mergeGate: "pnpm run test" },
   merge: { note: "deploys to staging" },
 });
 

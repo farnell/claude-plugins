@@ -65,7 +65,7 @@ using one as valid exactly when the adapter lists its type.
   "addendum": "docs/ralph/repo-policy.md",
   "worktreeSetup": ["pnpm install --frozen-lockfile --prefer-offline"],
   "installProbe": "pnpm exec vitest --version",
-  "commands": { "typecheck": "pnpm typecheck", "testFiles": "pnpm vitest run", "mergeGate": "pnpm test" },
+  "commands": { "typecheck": "pnpm typecheck", "testFiles": "pnpm vitest run", "mergeGate": "pnpm run test" },
   "merge": {
     "note": "Merging to main deploys to staging and applies new migrations to the staging DB; prod moves only at release.",
     "guard": "node scripts/migration-additive.ts --pr {pr}",

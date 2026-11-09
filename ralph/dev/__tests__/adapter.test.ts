@@ -11,7 +11,7 @@ import { ADAPTER_PATH, loadAdapter, parseAdapter } from "../../lib/adapter.ts";
 const MIN = {
   repo: "acme/app",
   addendum: "docs/ralph/repo-policy.md",
-  commands: { typecheck: "pnpm typecheck", testFiles: "pnpm vitest run", mergeGate: "pnpm test" },
+  commands: { typecheck: "pnpm typecheck", testFiles: "pnpm vitest run", mergeGate: "pnpm run test" },
   merge: { note: "deploys to staging" },
 };
 
@@ -50,6 +50,15 @@ describe("parseAdapter", () => {
     }
     for (const bit of ['"repo" must be "owner/name"', '"addendum"', '"commands.typecheck"', '"commands.mergeGate"', '"merge.note"', '"merge.afterMigration"', "invalid regex"]) {
       expect(msg).toContain(bit);
+    }
+  });
+
+  it("refuses a pnpm/npm `test` built-in as the merge gate: it eats the vitest reporter flags", () => {
+    expect(() => parseAdapter({ ...MIN, commands: { ...MIN.commands, mergeGate: "pnpm test" } })).toThrow(/use "pnpm run test"/);
+    expect(() => parseAdapter({ ...MIN, commands: { ...MIN.commands, mergeGate: "npm test" } })).toThrow(/use "npm run test"/);
+    expect(() => parseAdapter({ ...MIN, commands: { ...MIN.commands, mergeGate: "pnpm test" }, merge: { ...MIN.merge, vitestJson: false } })).not.toThrow();
+    for (const ok of ["pnpm run test", "pnpm test:release", "pnpm vitest run"]) {
+      expect(() => parseAdapter({ ...MIN, commands: { ...MIN.commands, mergeGate: ok } })).not.toThrow();
     }
   });
 

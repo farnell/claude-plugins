@@ -56,7 +56,7 @@ interface FakeOpts {
 const BASE_ADAPTER = {
   repo: "acme/app",
   addendum: "docs/ralph/repo-policy.md",
-  commands: { typecheck: "pnpm typecheck", testFiles: "pnpm vitest run", mergeGate: "pnpm test" },
+  commands: { typecheck: "pnpm typecheck", testFiles: "pnpm vitest run", mergeGate: "pnpm run test" },
   merge: { note: "deploys to staging" },
 };
 
@@ -126,10 +126,10 @@ describe("runMerge — the green path needs no agent", () => {
   it("up to date + green → type check, then the gate with a JSON reporter, then squash-merge", async () => {
     const f = fake();
     const r = await runMerge(TARGET, f.deps);
-    expect(r).toMatchObject({ status: "merged", sha: "headsha", migrationAdded: "" });
+    expect(r).toMatchObject({ status: "merged", sha: "headsha", migrationAdded: "", afterMigration: "continue" });
     expect(f.sh).toEqual([
       "pnpm typecheck",
-      "pnpm test --reporter=default --reporter=json --outputFile.json=/tmp/r/vitest.json",
+      "pnpm run test --reporter=default --reporter=json --outputFile.json=/tmp/r/vitest.json",
     ]);
     expect(f.calls).toContain("gh pr merge 42 --squash --delete-branch");
     expect(f.calls).not.toContain("git merge --no-edit origin/main");
@@ -171,7 +171,7 @@ describe("runMerge — the green path needs no agent", () => {
   it("vitestJson:false runs the gate command exactly as written", async () => {
     const f = fake({ adapter: { merge: { vitestJson: false } } });
     await runMerge(TARGET, f.deps);
-    expect(f.sh).toEqual(["pnpm typecheck", "pnpm test"]);
+    expect(f.sh).toEqual(["pnpm typecheck", "pnpm run test"]);
   });
 });
 
@@ -181,7 +181,7 @@ describe("runMerge — anything needing judgement goes back to the agent", () =>
     const f = fake({ gate: [{ code: 1, stdout: "x", stderr: "" }], report });
     const r = await runMerge(TARGET, f.deps);
     expect(r).toMatchObject({ status: "red", typecheckFailed: false, failedFiles: ["src/a.test.ts"], sha: "headsha" });
-    expect(r.message).toBe("pnpm test failed in 1 file(s)");
+    expect(r.message).toBe("pnpm run test failed in 1 file(s)");
     expect(f.calls.some((c) => c.startsWith("gh pr merge"))).toBe(false);
   });
 
@@ -235,7 +235,7 @@ describe("runMerge — a gate wrapper (adapter merge.gateWrapper, e.g. a machine
   it("runs the full gate through the wrapper", async () => {
     const f = fake({ adapter: locked });
     expect((await runMerge(TARGET, f.deps)).status).toBe("merged");
-    expect(f.sh).toContain("pnpm --silent heavy-job run --job ralph-gate -- pnpm test");
+    expect(f.sh).toContain("pnpm --silent heavy-job run --job ralph-gate -- pnpm run test");
   });
 
   it("retries while the wrapper says busy, and merges once it runs", async () => {

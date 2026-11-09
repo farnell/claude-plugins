@@ -198,9 +198,10 @@ const SCRIPTED_MERGE_SCHEMA = {
     guardReasons: { type: 'array', items: { type: 'string' } },
     message: { type: 'string' },
     detail: { type: 'string' },
+    afterMigration: { type: 'string', enum: ['continue', 'stop', ''], description: 'the JSON\'s afterMigration, copied exactly; "" when ok=false' },
     worktreePath: { type: 'string', description: 'git rev-parse --show-toplevel of your worktree' },
   },
-  required: ['ok', 'error', 'status', 'sha', 'migrationAdded', 'typecheckFailed', 'ciFailed', 'failedFiles', 'guardReasons', 'message', 'detail', 'worktreePath'],
+  required: ['ok', 'error', 'status', 'sha', 'migrationAdded', 'typecheckFailed', 'ciFailed', 'failedFiles', 'guardReasons', 'message', 'detail', 'afterMigration', 'worktreePath'],
 }
 
 const STAGE_MODEL = { red: 'opus', check: 'sonnet', 'blind-check': 'opus', review: 'opus', merge: 'sonnet' }
@@ -570,7 +571,7 @@ for (let i = 0; i < MAX_STEPS; i++) {
     })
     const scriptTree = (scripted && scripted.worktreePath) || ''
     if (scripted && scripted.ok && scripted.status === 'merged') {
-      res = { outcome: 'done', prNumber: n.prNumber, sha: scripted.sha, verdict: '', migrationAdded: scripted.migrationAdded, summary: `scripted merge: ${scripted.message}`, blockedReason: '', worktreePath: scriptTree }
+      res = { outcome: 'done', prNumber: n.prNumber, sha: scripted.sha, verdict: '', migrationAdded: scripted.migrationAdded, afterMigration: scripted.afterMigration, summary: `scripted merge: ${scripted.message}`, blockedReason: '', worktreePath: scriptTree }
     } else if (scripted && scripted.ok && scripted.status === 'busy') {
       // Another heavy job holds the gate's lock: not a failure of this task. Park it for this run.
       pendingCleanup = scriptTree
@@ -612,7 +613,10 @@ for (let i = 0; i < MAX_STEPS; i++) {
     if (n.stage === 'merge' && res.migrationAdded) {
       migrations.push({ task: n.taskId, files: res.migrationAdded })
       const note = A.merge.migrationMessage || 'see the repo addendum for what happens to it'
-      if (A.merge.afterMigration === 'stop') {
+      // Two independent reads of the adapter (preflight's copy, and the merge script's own load of
+      // .claude/ralph.json): either saying stop stops, so one mis-copied value can't carry a run past
+      // a migration the repo wants applied first.
+      if (A.merge.afterMigration === 'stop' || res.afterMigration === 'stop') {
         final = { status: 'migration-pending', message: `${n.taskId} merged migration ${res.migrationAdded}: ${note}` }
         break
       }
