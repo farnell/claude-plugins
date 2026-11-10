@@ -72,7 +72,11 @@ The authoring contract is `${CLAUDE_PLUGIN_ROOT}/docs/authoring-guide.md`. Read 
 yields a clean set: explicit checkboxes → a task table → numbered phases → H2/H3 headings. If
 none do, STOP and ask the user to point at the task list; never fabricate micro-tasks.
 
-Per task: a stable `id`, a short `title`, a **`pointer`** (`<doc> §<heading> — lines A,B`).
+Per task: a stable `id`, a short `title`, a **`pointer`** (`<doc> §<heading> — lines A,B`), and
+on every runnable code task **`files`**: the repo-relative paths it is expected to edit, best
+effort from its section (the batching check in Step 2 compares them). A task that batches several
+sections is titled `X and Y (S12 + S13)` with pointer `<doc> §S12 — lines A,B; §S13 — lines C,D`;
+every listed section's acceptance applies.
 
 ## Step 2 — kind, verify, deps, gates
 
@@ -95,8 +99,13 @@ Per task: a stable `id`, a short `title`, a **`pointer`** (`<doc> §<heading> �
   Typical: a CLI flag, a script, an env override, a route that reads an existing table, a guard
   test. When in doubt it is `standard`: a wrong `small` loses the independent red tests, which
   have caught real bugs. Print each task's size in the Step 4 plan so Matt can veto one.
-- **Batch tiny neighbours.** Two or three small code tasks that touch the same files and ship
-  together are one task, not three PRs.
+- **Batch tiny neighbours (the validator enforces it).** Two runnable code tasks, at least one
+  `small`, that share a path in `files` with one depending on the other (directly or
+  transitively, not through a gate) are a hard error: merge them into one multi-section task (one
+  PR) and drop the dep that only serialized them. Only if they truly must be separate PRs, add
+  `"unbatched": "<reason>"` to either (empty still errors). Fill `files` on every runnable code
+  task so the check can see it; a small one without `files` warns. See the authoring guide
+  §Batch tiny neighbours.
 - **`human_gate:true`** for anything a human must own: migration **apply**, live-DB / data writes,
   deploys and release/ship scripts, worker restarts, remote-host runs, flag and env flips, hosting /
   auth / payments settings, any change in another repo (this repo's task waits on it through a
@@ -146,7 +155,7 @@ Per task: a stable `id`, a short `title`, a **`pointer`** (`<doc> §<heading> �
       "attempts": 0, "commit": null, "notes": "", "updatedAt": null },
     { "id": "E2", "title": "...", "pointer": "<doc> §E2 — lines 115,126",
       "kind": "code", "size": "small", "status": "todo", "deps": ["HG-1"], "human_gate": false,
-      "verify": "gate", "attempts": 0, "commit": null, "notes": "", "updatedAt": null }
+      "files": ["src/lib/foo.ts", "src/lib/foo.test.ts"], "verify": "gate", "attempts": 0, "commit": null, "notes": "", "updatedAt": null }
   ]
 }
 ```

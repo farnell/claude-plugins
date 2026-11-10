@@ -402,7 +402,7 @@ function stagePrompt(n, scripted) {
     '',
     `Task ${n.taskId}: ${n.title}`,
     `  kind=${n.kind}${n.kind === 'code' ? ` · size=${n.size || 'standard'}` : ''} · verify=${n.verify || '(none)'}`,
-    `  spec slice (read ONLY this section of the doc, by heading): ${n.pointer}`,
+    `  spec slice (read ONLY the section(s) this pointer names, by heading — a pointer listing several § covers every one, and each one's acceptance applies): ${n.pointer}`,
     `  ledger: ${ledgerPath}`,
     `  branch: ${n.branch} · PR: ${pr}`,
     '',

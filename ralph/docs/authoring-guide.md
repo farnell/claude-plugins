@@ -52,8 +52,30 @@ Typical: a CLI flag, a script, an env override, a route that reads an existing t
 test. When in doubt it is `standard`: a wrong `small` loses the independent red tests, which have
 caught real bugs.
 
-The validator refuses `size: "small"` on any kind but `code`. Put two or three tiny tasks that
-touch the same files into ONE task rather than three PRs.
+The validator refuses `size: "small"` on any kind but `code`.
+
+### Batch tiny neighbours (enforced)
+
+Every task costs ~3–5 fresh agents, each starting with ~40k tokens of fixed context. A small task
+that edits the same file as a task it waits on is that cost twice for one change, so the validator
+**refuses** it. Every runnable code task in the ledger lists the repo-relative paths it expects to
+edit in **`files`** (best effort, from its section), and:
+
+> Two runnable (not done, not gated) `code` tasks, at least one `size: "small"`, that share a path
+> in `files`, where one depends on the other through `deps` (directly or through other tasks) →
+> **error**. A dep path that runs through a human gate or decision doesn't count: the gate has to
+> happen between them.
+
+Fix it by merging them into **one task** (one PR). A task may cover several doc sections: title
+`X and Y (S12 + S13)`, pointer `<doc> §S12 — lines A,B; §S13 — lines C,D`; the stages read every
+listed section, and every section's acceptance applies. Drop the dep that only existed to
+serialize the two. If they really must be separate PRs (the first ships behind a step that has to
+happen before the second, a review needs the first on its own), add
+`"unbatched": "<reason>"` to either task; an empty reason still errors. A runnable small code task
+with no `files` can't be checked, so it gets a warning.
+
+In the feature doc, put tiny same-file changes under one heading (or say `Batch with S12`) so the
+derivation needn't guess.
 ### Blind checks in a `measure` task: `Blind check: yes`
 
 If a measure task grades a sample and its method calls for a **blind** or **independent** check
@@ -243,10 +265,16 @@ preflight. Two tiers:
 - an open gate (`human_gate` or `decision`) without a valid `done_when` (including a type this
   repo does not provide, a repo-provided check its own validator rejects, a malformed `repo`, or
   `prod-includes` for a repo with no prod reader), or a `done_when` on a task that is not a gate;
-- `size` that is not `small | standard`, or `small` on a task that is not `code`.
+- `size` that is not `small | standard`, or `small` on a task that is not `code`;
+- a malformed `files` (not an array of strings) or a non-string `unbatched`;
+- an **unbatched same-file pair**: two runnable `code` tasks, at least one `small`, sharing a path
+  in `files`, one depending on the other (directly or transitively, not through a gate), and
+  neither carrying a non-empty `unbatched` reason — merge them (§Batch tiny neighbours).
 
 **Warnings (advisory, never block):**
-- a task whose pointer slice spans many lines (likely an and-joined mega-task — split it);
+- a task whose pointer slice spans many lines (likely an and-joined mega-task — split it); a
+  multi-section pointer counts the sum of its ranges;
+- a runnable `small` code task with no `files` (the batching check can't see it);
 - softer prod-touching wording ("deploy", "production", "flip flag", …) in a non-gated task —
   confirm it only *writes* code; if it applies/deploys, gate it;
 - a gate's `doc-contains` check on a file that is not on `origin/main` and that no task in the

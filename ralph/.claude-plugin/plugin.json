@@ -1,7 +1,7 @@
 {
   "name": "ralph",
   "description": "Ralph PR pipeline: grind a feature/roadmap doc into merged PRs, one per task — red tests, implement, check, Opus review, scripted merge — each stage a fresh agent in its own worktree, all state on GitHub so any session resumes. One core; each repo adds a small adapter (.claude/ralph.json).",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": {
     "name": "Matt Farnell"
   },
