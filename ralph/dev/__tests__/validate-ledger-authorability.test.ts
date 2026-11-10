@@ -578,11 +578,47 @@ describe("validateLedgerAuthorability — batching of small same-file neighbours
     expect(res.ok).toBe(true);
   });
 
-  it("no error when neither task is small", () => {
+  it("no error when neither task is small — but a 'consider batching' warning", () => {
     const res = validateLedgerAuthorability(
       ledger([ct("S1", { files: [MODAL] }), ct("S2", { files: [MODAL], deps: ["S1"], size: "standard" })]),
     );
     expect(res.ok).toBe(true);
+    const warns = res.warnings.filter((w) => w.includes("consider batching"));
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toContain('"S1"');
+    expect(warns[0]).toContain('"S2"');
+    expect(warns[0]).toContain(MODAL);
+  });
+
+  it("the standard-pair warning follows transitive deps, but not through a gate", () => {
+    const chain = validateLedgerAuthorability(
+      ledger([ct("S1", { files: [MODAL] }), ct("S2", { files: ["src/o.ts"], deps: ["S1"] }), ct("S3", { files: [MODAL], deps: ["S2"] })]),
+    );
+    expect(chain.warnings.filter((w) => w.includes("consider batching"))).toHaveLength(1);
+    const gated = validateLedgerAuthorability(
+      ledger([ct("S1", { files: [MODAL] }), ct("G1", { deps: ["S1"], human_gate: true }), ct("S2", { files: [MODAL], deps: ["G1"] })]),
+    );
+    expect(gated.warnings.filter((w) => w.includes("consider batching"))).toEqual([]);
+  });
+
+  it("no standard-pair warning without a shared file, without a dep link, or with an unbatched reason", () => {
+    const cases = [
+      [ct("S1", { files: [MODAL] }), ct("S2", { files: ["src/x.ts"], deps: ["S1"] })],
+      [ct("S1", { files: [MODAL] }), ct("S2", { files: [MODAL] })],
+      [ct("S1", { files: [MODAL] }), ct("S2", { files: [MODAL], deps: ["S1"], unbatched: "S1 carries the migration; the addendum keeps it on its own" })],
+    ];
+    for (const tasks of cases) {
+      expect(validateLedgerAuthorability(ledger(tasks)).warnings.filter((w) => w.includes("consider batching"))).toEqual([]);
+    }
+  });
+
+  it("a batched (folded) row is closed: no kind needed, never part of a batching pair", () => {
+    const folded = { ...ct("S1", { files: [MODAL], size: "small" }), status: "batched", batched_into: "S2", kind: undefined };
+    const res = validateLedgerAuthorability(ledger([folded, ct("S2", { files: [MODAL], deps: [], size: "small" }), ct("S3", { files: [MODAL], deps: ["S1"] })]));
+    expect(res.errors.filter((e) => e.includes('no "kind"'))).toEqual([]);
+    expect(res.errors.filter((e) => e.includes('"S1"') && e.includes("merge them"))).toEqual([]);
+    // S3's dep on the folded S1 is a dep on its host S2 — a small same-file pair.
+    expect(res.errors.filter((e) => e.includes('tasks "S2" and "S3"'))).toHaveLength(1);
   });
 
   it("no error when the tasks are not connected by deps", () => {
@@ -687,5 +723,28 @@ describe("pointerLineSpan — multi-section pointers", () => {
       ledger([task({ id: "T1", pointer: "docs/x.md §S12 — lines 10,20; §S13 — lines 390,400" })]),
     );
     expect(small.warnings.filter((w) => w.includes("spans"))).toEqual([]);
+  });
+});
+
+describe("span cap — a sensible 2–3 section batch does not warn", () => {
+  const spans = (pointer: string) =>
+    validateLedgerAuthorability(ledger([task({ id: "T1", pointer })])).warnings.filter((w) => w.includes("spans ~"));
+
+  it("three sections summing to 150 lines: no warning", () => {
+    expect(spans("docs/x.md §S1 — lines 10,60; §S2 — lines 100,150; §S3 — lines 200,250")).toEqual([]);
+  });
+
+  it("over 150 summed lines: warns, naming the cap", () => {
+    const w = spans("docs/x.md §S1 — lines 10,61; §S2 — lines 100,150; §S3 — lines 200,250");
+    expect(w).toHaveLength(1);
+    expect(w[0]).toMatch(/spans ~151 lines/);
+    expect(w[0]).toMatch(/~150-line cap/);
+  });
+
+  it("a done or batched row never gets the span warning", () => {
+    const res = validateLedgerAuthorability(
+      ledger([task({ id: "T1", status: "done", pointer: "docs/x.md §S1 — lines 1,400" })]),
+    );
+    expect(res.warnings.filter((w) => w.includes("spans ~"))).toEqual([]);
   });
 });

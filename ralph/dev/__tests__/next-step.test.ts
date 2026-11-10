@@ -597,3 +597,41 @@ describe("resolveTask — gates are judged in the repo's context (its adapter)",
     expect(resolveTask(g, undefined, done, { self: "acme/app", prodRepos: [], extraTypes: [] })).toEqual({ action: "park", reason: "gate-no-check" });
   });
 });
+
+describe("nextStep — batched (folded) rows", () => {
+  it("never runs or parks a batched row, and counts it apart from the open tasks", () => {
+    const tasks = [
+      task({ id: "A" }),
+      task({ id: "B", status: "batched", batched_into: "A" }),
+      task({ id: "C", status: "done" }),
+    ];
+    const got = nextStep({ feature: { slug: "feat" }, tasks }, [], new Set());
+    expect(got.next).toMatchObject({ taskId: "A" });
+    expect(got.parked).toEqual([]);
+    expect(got.remaining).toBe(1);
+    expect(got.batched).toBe(1);
+  });
+
+  it("a dep on a batched row waits on its host", () => {
+    const tasks = [
+      task({ id: "A" }),
+      task({ id: "B", status: "batched", batched_into: "A" }),
+      task({ id: "D", deps: ["B"] }),
+    ];
+    let got = nextStep({ feature: { slug: "feat" }, tasks }, [], new Set());
+    expect(got.parked).toEqual([{ id: "D", reason: "deps-not-met" }]);
+    tasks[0]!.status = "done";
+    got = nextStep({ feature: { slug: "feat" }, tasks }, [], new Set());
+    expect(got.next).toMatchObject({ taskId: "D" });
+  });
+
+  it("a host's dep on a task folded into it drops out (no self-deadlock)", () => {
+    const tasks = [task({ id: "A", status: "batched", batched_into: "H" }), task({ id: "H", deps: ["A"] })];
+    const got = nextStep({ feature: { slug: "feat" }, tasks }, [], new Set());
+    expect(got.next).toMatchObject({ taskId: "H" });
+  });
+
+  it("resolveTask skips a batched row", () => {
+    expect(resolveTask(task({ status: "batched", batched_into: "X" }), undefined, new Set())).toEqual({ action: "skip" });
+  });
+});

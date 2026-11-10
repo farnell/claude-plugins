@@ -20,7 +20,7 @@ const EMPTY_NEXT = {
 };
 
 type PlanScript =
-  | { stage: string; kind?: string; size?: string; lastEvent?: string; redSha?: string; prevRedSha?: string; redFiles?: string[]; remaining?: number }
+  | { stage: string; kind?: string; size?: string; lastEvent?: string; redSha?: string; prevRedSha?: string; redFiles?: string[]; remaining?: number; batched?: number }
   | { raw: Record<string, unknown> }
   // A planner that refused or failed: ran nothing, so it reports no cleanup.
   | { refused: string }
@@ -79,7 +79,7 @@ async function runWorkflow(plans: PlanScript[], o: RunOpts = {}) {
       if ("refused" in p) return { ok: false, error: p.refused, cleanup: "", hasNext: false, next: EMPTY_NEXT, parked: [], remaining: -1 };
       if ("raw" in p) return { ok: true, error: "", cleanup, hasNext: false, next: EMPTY_NEXT, parked: [], remaining: 0, ...p.raw };
       return {
-        ok: true, error: "", cleanup, hasNext: true, parked: [], remaining: p.remaining ?? 1,
+        ok: true, error: "", cleanup, hasNext: true, parked: [], remaining: p.remaining ?? 1, batched: p.batched ?? 0,
         next: { ...EMPTY_NEXT, taskId: "T1", title: "t", pointer: "p", kind: p.kind ?? "code", size: p.size ?? "standard", verify: "gate", stage: p.stage, lastEvent: p.lastEvent ?? "none", branch: "ralph/f/T1", markerCount: planIdx, redSha: p.redSha ?? "", prevRedSha: p.prevRedSha ?? "", redFiles: p.redFiles ?? [] },
       };
     }
@@ -277,6 +277,45 @@ describe("ralph-loop workflow plumbing (2026-10-12 lessons)", () => {
       const { result } = await runWorkflow([bad, bad]);
       expect(result.status).toBe("error");
       expect(result.message).toMatch(/parks 2 of 5 open task/);
+    });
+
+    it("a mid-run fold (rows kept as status batched) is accounted for, not an unexplained drop (2026-11-10)", async () => {
+      const { calls, result } = await runWorkflow([
+        { stage: "review", remaining: 13, batched: 0 },
+        { stage: "implement", remaining: 11, batched: 2 },
+        { raw: { hasNext: false, parked: parkedN(11), remaining: 11, batched: 2 } },
+      ]);
+      expect(plansOf(calls)).not.toContain("ralph:plan:2:recheck");
+      expect(calls.filter((c) => c.opts.isolation === "worktree").map((c) => c.opts.label)).toEqual(["ralph:T1:review", "ralph:T1:implement"]);
+      expect(result.status).toBe("parked");
+    });
+
+    it("a fold and a merge in the same step are both accounted for", async () => {
+      const { calls } = await runWorkflow([
+        { stage: "merge", remaining: 13, batched: 0 },
+        { stage: "red", remaining: 10, batched: 2 },
+      ]);
+      expect(plansOf(calls)).not.toContain("ralph:plan:2:recheck");
+    });
+
+    it("rows that vanish (deleted, not folded) still stop the run", async () => {
+      const deleted = { stage: "implement", remaining: 11, batched: 0 };
+      const { result } = await runWorkflow([{ stage: "review", remaining: 13, batched: 0 }, deleted, deleted]);
+      expect(result.status).toBe("error");
+      expect(result.message).toMatch(/dropped from 13 to 11 with 0 merge\(s\) and 0 fold\(s\)/);
+    });
+
+    it("a fold explains only as many rows as it batched", async () => {
+      const partly = { stage: "implement", remaining: 10, batched: 2 };
+      const { result } = await runWorkflow([{ stage: "review", remaining: 13, batched: 0 }, partly, partly]);
+      expect(result.status).toBe("error");
+      expect(result.message).toMatch(/with 0 merge\(s\) and 2 fold\(s\)/);
+    });
+
+    it("the plan schema requires the batched count, and the failure shape sets it to 0", async () => {
+      expect(SRC).toMatch(/required: \[[^\]]*'remaining', 'batched'\]/);
+      const { calls } = await runWorkflow([]);
+      expect(calls.find((c) => c.opts.label === "ralph:plan:1")!.prompt).toMatch(/batched=0/);
     });
 
     it("a real finish still completes: the last merge takes open tasks from 1 to 0", async () => {

@@ -509,12 +509,15 @@ MERGE GATE you run goes through it, as the addendum shows.
   never edited by hand.
 - Only the implement stage writes the ledger, and only its own task's fields. The one other writer
   is `tick-gates.ts`, which only flips open gates to `done`.
-- Status enum: `todo | in_progress | done | blocked | awaiting_review`. The pipeline only ever
-  sets `done`. `blocked` / `awaiting_review` survive only from older ledgers and park the task.
+- Status enum: `todo | in_progress | done | blocked | awaiting_review | batched`. The pipeline
+  only ever sets `done`. `batched` (+ `batched_into: "<host>"`) marks a task folded into another
+  task's PR: closed like `done`, and a dep on it is a dep on its host. Only a ledger refresh sets
+  it; the host's PR ticks only the host. `blocked` / `awaiting_review` survive only from older
+  ledgers and park the task.
 - Every runnable task carries a `kind` (`code | docs | measure | decision`). The authorability
   validator enforces it.
 - A code task may carry `size: "small" | "standard"` (absent = standard); the validator refuses
   `small` on any other kind.
 - A code task may carry `files` (the repo paths it edits) and `unbatched` (why it stays a separate
   PR from a same-file neighbour); the validator uses them to refuse an unbatched small same-file
-  pair (authoring guide §Batch tiny neighbours).
+  pair (authoring guide §Batch by default).

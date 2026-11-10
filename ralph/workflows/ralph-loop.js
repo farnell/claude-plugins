@@ -113,8 +113,9 @@ const PLAN_SCHEMA = {
     next: NEXT_TASK,
     parked: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, reason: { type: 'string' } }, required: ['id', 'reason'] } },
     remaining: { type: 'integer' },
+    batched: { type: 'integer', description: 'rows folded into another task (status "batched")' },
   },
-  required: ['ok', 'error', 'cleanup', 'hasNext', 'next', 'parked', 'remaining'],
+  required: ['ok', 'error', 'cleanup', 'hasNext', 'next', 'parked', 'remaining', 'batched'],
 }
 
 const GATE_ROW = {
@@ -237,7 +238,7 @@ function planPrompt(skip, cleanupPath) {
     runHelper(`${lib('next-step')} "${ledgerPath}"${skipArg}`),
     'On exit=0, return that JSON object through the schema with ok=true and error="".',
     // -1, never 0: a failure relayed with ok=true must not read as "everything is done".
-    'On failure also set hasNext=false, remaining=-1, parked=[], and a "next" object with empty strings / zeros.',
+    'On failure also set hasNext=false, remaining=-1, batched=0, parked=[], and a "next" object with empty strings / zeros.',
     'Do not edit, fix or investigate anything.',
   ].join('\n')
 }
@@ -251,10 +252,15 @@ function planProblem(plan, prev, mergeRan) {
   if (!plan.hasNext && plan.parked.length !== plan.remaining) {
     return `the planner says nothing is runnable but parks ${plan.parked.length} of ${plan.remaining} open task(s)`
   }
-  // Open tasks only drop when a merge lands (gate ticks run before the grind).
-  const allowed = mergeRan ? 1 : 0
-  if (prev && plan.remaining < prev.remaining - allowed) {
-    return `open tasks dropped from ${prev.remaining} to ${plan.remaining} with ${allowed} merge(s) since the last plan`
+  // Open tasks only drop when a merge lands (gate ticks run before the grind), or
+  // when a ledger refresh FOLDS a task into another (status "batched", kept in the
+  // ledger). 2026-11-10: a mid-run fold that deleted two rows stopped the run with
+  // "dropped from 13 to 11 with 0 merge(s)"; a fold that keeps the rows as batched
+  // is accounted for, a row that vanishes still is not.
+  const merges = mergeRan ? 1 : 0
+  const folded = prev ? Math.max(0, (plan.batched || 0) - (prev.batched || 0)) : 0
+  if (prev && plan.remaining < prev.remaining - merges - folded) {
+    return `open tasks dropped from ${prev.remaining} to ${plan.remaining} with ${merges} merge(s) and ${folded} fold(s) since the last plan`
   }
   return ''
 }

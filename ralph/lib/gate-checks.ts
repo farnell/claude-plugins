@@ -25,6 +25,8 @@
  * an app gate that waits for the API PR it depends on to reach API prod. When
  * absent the check reads THIS repo (the adapter's `repo`).
  */
+import { isClosed, resolveHost } from "./ledger-status.ts";
+
 export type DoneCheck =
   /** the PR is merged */
   | { type: "pr-merged"; pr: number; repo?: string }
@@ -276,15 +278,16 @@ export async function planGateTicks(
   const noCheck: string[] = [];
 
   for (const t of ledger.tasks) {
-    if (isGate(t) && t.status !== "done" && validateDoneWhen(t.done_when, ctx).length > 0) noCheck.push(t.id);
+    if (isGate(t) && !isClosed(t) && validateDoneWhen(t.done_when, ctx).length > 0) noCheck.push(t.id);
   }
 
   let changed = true;
   while (changed) {
     changed = false;
     for (const t of ledger.tasks) {
-      if (!isGate(t) || t.status === "done" || noCheck.includes(t.id)) continue;
-      if ((t.deps ?? []).some((d) => !done.has(d))) continue;
+      if (!isGate(t) || isClosed(t) || noCheck.includes(t.id)) continue;
+      // A dep on a batched task waits on its host (ledger-status.ts).
+      if ((t.deps ?? []).some((d) => !done.has(resolveHost(d, ledger.tasks)))) continue;
       const checks = Array.isArray(t.done_when) ? t.done_when : [t.done_when!];
       const results = [];
       for (const c of checks) results.push(await evaluateCheck(c, io, ctx));

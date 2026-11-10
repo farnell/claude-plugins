@@ -99,13 +99,17 @@ every listed section's acceptance applies.
   Typical: a CLI flag, a script, an env override, a route that reads an existing table, a guard
   test. When in doubt it is `standard`: a wrong `small` loses the independent red tests, which
   have caught real bugs. Print each task's size in the Step 4 plan so Matt can veto one.
-- **Batch tiny neighbours (the validator enforces it).** Two runnable code tasks, at least one
-  `small`, that share a path in `files` with one depending on the other (directly or
-  transitively, not through a gate) are a hard error: merge them into one multi-section task (one
-  PR) and drop the dep that only serialized them. Only if they truly must be separate PRs, add
-  `"unbatched": "<reason>"` to either (empty still errors). Fill `files` on every runnable code
-  task so the check can see it; a small one without `files` warns. See the authoring guide
-  §Batch tiny neighbours.
+- **Batch by default.** A doc section is a unit of spec; a ledger task is a unit of PR, and reviews
+  are LLM-run, so big PRs are fine. Group related code sections (same feature area or panel, same
+  `files`, or a direct dep chain) into one task covering **up to ~3 sections**, with the
+  multi-section title and pointer from Step 1, `files` = the union, `deps` = the union minus the
+  members (drop deps that only serialized them). It is `small` only if every member would be.
+  Keep a task on its own only when: it carries a migration (or the addendum says never-batch), it
+  is a gate/decision or the chain between members crosses one, the kinds differ, the combined
+  slice is over ~150 summed lines, or it has a stated `"unbatched": "<reason>"`. The validator
+  **errors** on a same-file dep-linked pair where either is small, and **warns** on a standard
+  pair; a non-empty `unbatched` silences both. Fill `files` on every runnable code task; a small
+  one without `files` warns. See the authoring guide §Batch by default.
 - **`human_gate:true`** for anything a human must own: migration **apply**, live-DB / data writes,
   deploys and release/ship scripts, worker restarts, remote-host runs, flag and env flips, hosting /
   auth / payments settings, any change in another repo (this repo's task waits on it through a
@@ -163,6 +167,14 @@ every listed section's acceptance applies.
 Refresh, don't clobber: merge by `id`, keep `status`/`attempts`/`notes`, add new tasks as `todo`,
 flag a `done` task whose title/pointer changed materially. Render the `.md` with
 RALPH `render-ledger <ledger.json>`.
+
+**Batching an existing ledger = fold, never delete.** To batch open tasks on a refresh (even
+mid-run), keep each folded row with `"status": "batched"` and `"batched_into": "<host id>"`; extend
+the host's title, pointer and `files`, and add the folded task's deps to the host. Fold only a
+task with no open PR (close it first), never a gate, and never into a gate or a batched row. The
+deps validator checks the fold; the loop treats a batched row as closed and counts it apart, so a
+live run carries on. Deleting rows instead makes the next plan look like tasks vanished and stops
+the run. Authoring guide §Folding a task into another mid-run.
 
 **Both validators must pass, or STOP and show the errors** (never invent a fake `verify` to get
 past one):
@@ -242,7 +254,9 @@ The workflow returns one object. Lead with `status`:
 - `migration-pending` (a repo whose adapter stops after a merged migration): show `message` — it
   says what to apply — then Matt re-runs `/ralph`.
 - `stuck` / `cap-reached` / `error`: show `message` and the last few `history` rows; re-running
-  continues from the same place. An `error` now carries the failing helper's real stderr and
+  continues from the same place. An error "open tasks dropped from N to M with … fold(s)" means
+  rows left the ledger without a merge or a fold: if someone batched by deleting rows, restore
+  them as `status: "batched"` folds (Step 3) and re-run. An `error` now carries the failing helper's real stderr and
   stdout; read them before guessing.
 - `preflight-failed`: show `message` verbatim. It is already plain language (low disk, a broken
   install, a missing or invalid `.claude/ralph.json`, missing ledger) and says what to do.

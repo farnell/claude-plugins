@@ -42,3 +42,19 @@ describe("ledgerMdPath", () => {
     expect(ledgerMdPath("docs/ralph/feat-LEDGER.json")).toBe("docs/ralph/feat-LEDGER.md");
   });
 });
+
+describe("renderLedgerMd — batched rows", () => {
+  it("renders a folded task as closed and names its host", () => {
+    const md = renderLedgerMd(
+      {
+        feature: { slug: "f" },
+        tasks: [
+          { id: "A", title: "Host", status: "todo", kind: "code" },
+          { id: "B", title: "Folded", status: "batched", batched_into: "A", kind: "measure" },
+        ],
+      },
+      "x.json",
+    );
+    expect(md).toContain("- [x] **B** Folded — ↪ batched into A\n");
+  });
+});
