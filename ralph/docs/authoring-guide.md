@@ -32,27 +32,42 @@ Every runnable task declares a `Kind:`. It decides the stages the task goes thro
 
 | `kind` | Stages | `verify` allowed |
 |---|---|---|
-| `code` | red → implement → check → review → merge; with `Size: small`: implement → review → merge | `gate` or a test command. **Never `manual`**: code is proven by its red tests; split anything judged by eye or measured on a live box into a `measure` task |
+| `code` | lane `full`: red → implement → check → review → merge; lane `light`: implement → review → merge (§Lanes) | `gate` or a test command. **Never `manual`**: code is proven by its red tests; split anything judged by eye or measured on a live box into a `measure` task |
 | `docs` | implement → review (which also does the check) → merge | an artifact check command, or `manual`. **Never `gate`**: tsc + tests prove nothing about prose |
 | `measure` | implement (run read-only measurements, record the numbers) → [blind-check] → review (which also does the check) → (manual: Matt merges) | a check command, or `manual` |
 | `decision` | none: Matt decides | must be `HUMAN-GATED` |
 
 
-### Small code tasks: `Size: small`
+### Lanes: how much pipeline a code task gets (Ralph decides)
 
-A code task whose change is small and low-risk can skip the red and check stages: implement
-writes the tests with the code, and review does the check duties. Each skipped stage is a fresh
-agent that starts with ~40k tokens of fixed context, so this roughly halves a small task's cost.
-Add a `Size: small` line when every rule holds:
+At derivation `/ralph` triages every runnable code task into a **lane** and records it in the
+ledger with a one-line `lane_reason` (from ledger version 3 the validator requires the lane). You
+don't have to write one: an optional `Lane: full` or `Lane: light` line in a section overrides
+Ralph's call. (An old `Size: small` line reads as `Lane: light`.)
 
-**When a code task is `small`** (all of these hold): no migration, no change to core decision
-logic or a TS↔SQL twin, no new shared source of truth, nothing that writes a live store, about
-300 changed lines or fewer outside tests, and nothing the repo's addendum lists as never-small.
-Typical: a CLI flag, a script, an env override, a route that reads an existing table, a guard
-test. When in doubt it is `standard`: a wrong `small` loses the independent red tests, which have
-caught real bugs.
+| Lane | Stages | For |
+|---|---|---|
+| `full` | red → implement → check → review → merge | money, credits, billing, pricing; auth, sessions, tokens, permissions; data writes and every migration; time / date / timezone logic; core decision logic or a TS↔SQL twin; a new shared source of truth; security; whatever the repo's addendum lists as never-light |
+| `light` | implement → review → merge (= `size: "small"`) | UI markup, copy, layout, styling; wiring an existing endpoint or component; removals; a11y attributes; guard tests; CLI flags, scripts, env overrides; a route that only reads an existing table |
+| `human` | none: Matt's step | every gate and decision |
 
-The validator refuses `size: "small"` on any kind but `code`.
+Each skipped stage is a fresh agent that starts with ~40k tokens of fixed context, so light
+roughly halves a task's cost. Light is the default for code; full is earned by risk. A light task
+still gets an Opus review of every line, and its implement agent writes the tests with the code;
+what it loses is the *independent* red tests, which have caught real bugs in risky code, hence
+the full lane for it.
+
+The validator: an unknown lane; `human` on a non-gate or a gate in another lane; `full` on a
+non-code task; `full` + `size: "small"` or `light` + `size: "standard"` (the lane sets the size;
+don't write both); `light` on a task that adds a migration (a migrations / drizzle / `.sql` path
+in `files`, or "migration" in the title). It warns when a light task's wording looks like full
+territory (credits, auth, timezone, …), when a lane has no `lane_reason`, and when light tasks
+could ship as fewer PRs (§Batch by default). `size: "small"` stays valid on old ledgers, only on
+code tasks.
+
+**A tiny doc is one PR.** If after triage there are no `full` tasks and at most two light
+batches (gates aside), `/ralph` folds every runnable section into one task: one implement
+agent, one review, one PR, through the normal loop (never in the chat session).
 
 ### Batch by default
 
@@ -66,8 +81,13 @@ edit in **`files`** (best effort, from its sections).
 
 **The batch shape.** Title `X and Y (S12 + S13)`; pointer `<doc> §S12 — lines A,B; §S13 — lines C,D`.
 The stages read every listed section, and every section's acceptance applies. `files` is the union;
-`deps` is the union minus the members; the batch is `size: "small"` only if every member would be
-small, else standard. A dep that only existed to serialize two members on a shared file goes away.
+`deps` is the union minus the members; the batch is `light` only if every member would be
+light, else `full`.
+
+**Light work is swept harder.** Light sections need not share files to share a PR: every light
+section that waits on the same open gates goes into as few tasks as the ~150-line cap allows (and
+never two that have another open task between them in the dep graph). The validator warns with a
+suggested grouping when light tasks could ship as fewer PRs. A dep that only existed to serialize two members on a shared file goes away.
 
 **Keep a task on its own when:**
 - it carries a migration (or the repo's addendum says never-batch);
@@ -80,8 +100,8 @@ small, else standard. A dep that only existed to serialize two members on a shar
 **What the validator enforces** (both apply to runnable, not-done, not-gated `code` tasks that
 share a path in `files` where one depends on the other through `deps`, directly or through other
 tasks but never through a gate):
-- at least one of the pair `size: "small"` → **error**: merge them;
-- both standard → **warning**: consider batching them.
+- at least one of the pair light (`size: "small"`) → **error**: merge them;
+- both full / standard → **warning**: consider batching them.
 
 Either is silenced by a non-empty `"unbatched": "<reason>"` on either task (an empty string still
 errors). A runnable small code task with no `files` can't be checked, so it warns.
@@ -295,6 +315,9 @@ preflight. Two tiers:
   repo does not provide, a repo-provided check its own validator rejects, a malformed `repo`, or
   `prod-includes` for a repo with no prod reader), or a `done_when` on a task that is not a gate;
 - `size` that is not `small | standard`, or `small` on a task that is not `code`;
+- a lane problem: an unknown `lane`; no `lane` on a runnable code task in a `ledgerVersion` ≥ 3
+  ledger; `human` on a non-gate or a gate in another lane; `full` on a non-code task; `full` +
+  `size: "small"`; `light` + `size: "standard"`; `light` on a task that adds a migration;
 - a malformed `files` (not an array of strings) or a non-string `unbatched`;
 - an **unbatched same-file pair**: two runnable `code` tasks, at least one `small`, sharing a path
   in `files`, one depending on the other (directly or transitively, not through a gate), and
@@ -306,7 +329,10 @@ preflight. Two tiers:
 **Warnings (advisory, never block):**
 - a runnable task whose pointer slice spans over ~150 lines — a multi-section pointer counts the
   sum of its ranges, so a sensible 2–3 section batch doesn't warn; split it or batch fewer;
-- a runnable `small` code task with no `files` (the batching check can't see it);
+- a runnable light (`small`) code task with no `files` (the batching check can't see it);
+- a light task whose wording looks like full-lane territory, or a lane with no `lane_reason`;
+- light tasks waiting on the same gates that could ship as fewer PRs within the span cap (with a
+  suggested grouping);
 - two runnable **standard** code tasks sharing a path in `files`, one depending on the other (not
   through a gate), with no `unbatched` reason — consider batching them;
 - softer prod-touching wording ("deploy", "production", "flip flag", …) in a non-gated task —

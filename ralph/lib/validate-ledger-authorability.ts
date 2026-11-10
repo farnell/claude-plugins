@@ -25,7 +25,12 @@
 //                · an unbatched same-file pair: two runnable code tasks, at
 //                  least one small, that share a path in `files` and where one
 //                  depends on the other (directly or transitively) — merge
-//                  them into one task, or justify with `unbatched: "<reason>"`.
+//                  them into one task, or justify with `unbatched: "<reason>"`,
+//                · a lane problem (1.3.0): an unknown `lane`, a missing lane on a
+//                  runnable code task in a ledgerVersion >= 3 ledger, `human`
+//                  on a non-gate (or a gate in another lane), `full` on a
+//                  non-code task, `full` + size:"small", `light` +
+//                  size:"standard", or `light` on a task that adds a migration.
 //   warnings[] — ADVISORY. Heuristic / false-positive-prone (never blocks):
 //                · a task whose slice spans many lines (likely an and-joined
 //                  mega-task worth splitting),
@@ -34,7 +39,12 @@
 //                  check can't compare it with its neighbours),
 //                · two runnable STANDARD code tasks with the same shape as the
 //                  hard error above (shared file, linked by deps): consider
-//                  batching them ("batch by default").
+//                  batching them ("batch by default"),
+//                · a `light` task whose wording looks like `full` territory
+//                  (money, auth, data writes, time zones, security), or a lane
+//                  with no `lane_reason`,
+//                · light tasks that could be swept into fewer PRs (same open
+//                  gates upstream, summed slices within the span cap).
 //
 // Wired into the same two points as the dep validator: the /ralph skill
 // (derivation time) and the ralph-loop workflow preflight.
@@ -46,7 +56,7 @@ import { loadAdapter, type Adapter } from "./adapter.ts";
 import { realRunCheck, validateExtraCheck, type RunCheck } from "./repo-check.ts";
 import { checkTypes, contextFrom, extraChecks, NO_CONTEXT, validateDoneWhen, type GateContext } from "./gate-checks.ts";
 import { isEntryPoint } from "./is-entry-point.ts";
-import { SIZES } from "./next-step.ts";
+import { effectiveSize, LANES, SIZES } from "./next-step.ts";
 import { isClosed } from "./ledger-status.ts";
 
 // `verify` sentinels (see the loop / policy §5):
@@ -83,6 +93,10 @@ export interface AuthorabilityTaskLike {
   done_when?: unknown;
   blind_check?: unknown;
   size?: unknown;
+  /** The triage lane (1.3.0): full | light | human (next-step.ts LANES). */
+  lane?: unknown;
+  /** One line: why this lane (printed in the /ralph plan). */
+  lane_reason?: unknown;
   deps?: unknown;
   /** Repo-relative paths the task expects to edit (code tasks; feeds the batching check). */
   files?: unknown;
@@ -191,6 +205,9 @@ export function validateLedgerAuthorability(
   }
 
   const realGate = hasRealFeatureGate(ledger);
+  // Ledgers from 1.3.0 on (ledgerVersion >= 3) must triage every runnable code task.
+  const feature = (ledger?.feature ?? {}) as { ledgerVersion?: unknown };
+  const lanesRequired = typeof feature.ledgerVersion === "number" && feature.ledgerVersion >= 3;
   // What the ledger's own tasks say they write: a file named in any non-gate
   // task's title / pointer / verify / notes counts as "created by a task".
   const taskText = rawTasks
@@ -309,6 +326,42 @@ export function validateLedgerAuthorability(
       }
     }
 
+    // ---- lane (the triage; maps onto size) ----
+    const lane = obj.lane;
+    if (lane === undefined || lane === null) {
+      if (lanesRequired && runnable && kind === "code") {
+        errors.push(
+          `${label} has no "lane" — triage it: "full" (red → implement → check → review: money, auth, data writes, migrations, time zones, core decision logic, security) or "light" (implement → review: UI markup, copy, layout, wiring, removals, a11y, guard tests).`,
+        );
+      }
+    } else if (typeof lane !== "string" || !(LANES as readonly string[]).includes(lane)) {
+      errors.push(`${label} has an unknown "lane" (${String(lane)}) — use one of ${LANES.join(" | ")}.`);
+    } else {
+      const isGate = gated || kind === "decision";
+      if (lane === "human" && !isGate) {
+        errors.push(`${label} has lane:"human" but is not a human gate — set human_gate:true, or triage it "full" or "light".`);
+      } else if (lane !== "human" && isGate) {
+        errors.push(`${label} is a human gate / decision in lane "${lane}" — a gate is always lane "human".`);
+      } else if (lane === "full" && kind !== "code") {
+        errors.push(`${label} has lane:"full" but is a ${String(kind)} task — only a code task has the full pipeline; use "light".`);
+      } else if (lane === "full" && obj.size === "small") {
+        errors.push(`${label} has lane:"full" and size:"small" — they contradict; drop size (the lane decides it).`);
+      } else if (lane === "light" && obj.size === "standard") {
+        errors.push(`${label} has lane:"light" and size:"standard" — they contradict; drop size (the lane decides it).`);
+      } else if (lane === "light" && addsMigration(obj)) {
+        errors.push(
+          `${label} is lane:"light" but adds a migration — a migration always takes the full lane (independent red tests) and stays its own task.`,
+        );
+      } else if (lane === "light" && runnable && FULL_LANE_HINT.test(searchText)) {
+        warnings.push(
+          `${label} is lane:"light" but its wording ("${matchText(searchText, FULL_LANE_HINT)}") looks like full-lane territory (money, auth, data writes, time zones, security) — confirm the change is only markup/copy/wiring, else make it "full".`,
+        );
+      }
+      if (runnable && (typeof obj.lane_reason !== "string" || obj.lane_reason.trim() === "")) {
+        warnings.push(`${label} has a lane but no "lane_reason" — add one line saying why, so the plan can show it.`);
+      }
+    }
+
     // ---- files / unbatched (shape; the batching check runs after the loop) ----
     if (obj.files !== undefined && !isStringArray(obj.files)) {
       errors.push(
@@ -320,7 +373,7 @@ export function validateLedgerAuthorability(
         `${label} has a non-string "unbatched" (${describeType(obj.unbatched)}) — use a reason string, or omit it.`,
       );
     }
-    if (runnable && kind === "code" && obj.size === "small" && filesOf(obj).length === 0) {
+    if (runnable && kind === "code" && effectiveSize(obj) === "small" && filesOf(obj).length === 0) {
       warnings.push(
         `${label} is a small code task with no "files" — list the repo paths it edits so the batching check can compare it with its same-file neighbours.`,
       );
@@ -382,6 +435,7 @@ export function validateLedgerAuthorability(
   const batching = batchingFindings(rawTasks as AuthorabilityTaskLike[]);
   errors.push(...batching.errors);
   warnings.push(...batching.warnings);
+  warnings.push(...lightSweepWarnings(rawTasks as AuthorabilityTaskLike[]));
 
   return { ok: errors.length === 0, errors, warnings };
 }
@@ -467,7 +521,7 @@ function batchingFindings(tasks: AuthorabilityTaskLike[]): { errors: string[]; w
       if (shared.length === 0) continue;
       if (hasUnbatchedReason(later) || hasUnbatchedReason(earlier)) continue;
       const sharedList = shared.map((f) => `"${f}"`).join(", ");
-      if (later.size !== "small" && earlier.size !== "small") {
+      if (effectiveSize(later) !== "small" && effectiveSize(earlier) !== "small") {
         warnings.push(
           `tasks "${earlier.id}" and "${later.id}" both edit ${sharedList} and "${later.id}" depends on "${earlier.id}" — consider batching them into one task (one PR; its pointer can list both sections), or add "unbatched": "<reason>" if they must be separate PRs (a migration the addendum keeps on its own, a combined slice over ~${MEGA_TASK_LINE_SPAN} lines).`,
         );
@@ -489,6 +543,112 @@ function batchingFindings(tasks: AuthorabilityTaskLike[]): { errors: string[]; w
 // A slice bigger than this many lines probably bundles more than one unit of
 // work. Conservative on purpose — this is a warning, not a block.
 const MEGA_TASK_LINE_SPAN = 150;
+
+// ---------------------------------------------------------------------------
+// Lanes (1.3.0). A light task is cheap (2 stages), but each one is still a PR
+// and ~3 fresh agents, so light work is swept into as few tasks as the gates
+// allow: tasks waiting on the same open gates can share a PR, up to the span
+// cap. The first 5 tasks of a mostly-UI roadmap cost ~3.7M tokens; much of
+// it was trivial UI polish split into separate PRs.
+// ---------------------------------------------------------------------------
+
+// Wording that usually means the full lane. A warning, never an error.
+const FULL_LANE_HINT =
+  /\b(credits?|billing|payments?|stripe|refunds?|invoices?|pric(e|es|ing)|money|auth\w*|sessions?|passwords?|permissions?|tokens?|migrations?|backfill|time ?zones?|timezone|tz|security|encrypt\w*|secrets?)\b/i;
+
+/** A task that adds a migration: a migrations/drizzle/.sql path in `files`, or "migration" in its title. */
+function addsMigration(t: AuthorabilityTaskLike): boolean {
+  if (filesOf(t).some((f) => /(^|\/)(migrations?|drizzle)\//i.test(f) || /\.sql$/i.test(f))) return true;
+  return typeof t.title === "string" && /\bmigrations?\b/i.test(t.title);
+}
+
+function lightSweepWarnings(tasks: AuthorabilityTaskLike[]): string[] {
+  const byId = new Map<string, AuthorabilityTaskLike>();
+  for (const t of tasks) if (t && typeof t.id === "string" && t.id !== "" && !byId.has(t.id)) byId.set(t.id, t);
+  const depsOf = (t: AuthorabilityTaskLike): string[] =>
+    Array.isArray(t.deps) ? t.deps.filter((d): d is string => typeof d === "string") : [];
+
+  // The open gates a task waits on, directly or transitively (through batched rows to their hosts).
+  const gatesUpstream = (t: AuthorabilityTaskLike): string => {
+    const gates = new Set<string>();
+    const seen = new Set<string>();
+    const stack = depsOf(t);
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const d = byId.get(id);
+      if (!d || d.status === "done") continue;
+      if (d.status === "batched") {
+        if (typeof d.batched_into === "string") stack.push(d.batched_into);
+        continue;
+      }
+      if (isGateLike(d)) gates.add(id);
+      stack.push(...depsOf(d));
+    }
+    return [...gates].sort().join(",");
+  };
+
+  // Open deps of a task, with a dep on a batched row read as its host.
+  const openDeps = (t: AuthorabilityTaskLike): string[] =>
+    depsOf(t)
+      .map((d) => {
+        const r = byId.get(d);
+        return r && r.status === "batched" && typeof r.batched_into === "string" ? r.batched_into : d;
+      })
+      .filter((d) => {
+        const r = byId.get(d);
+        return !!r && !isClosed(r);
+      });
+  // Does x reach y only through some OTHER open task? Then x and y can't share
+  // a PR without that task joining too (it would sit both before and after it).
+  const reachesViaOther = (x: string, y: string): boolean => {
+    const seen = new Set<string>();
+    const stack = openDeps(byId.get(x)!).filter((d) => d !== y);
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (id === y) return true;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      stack.push(...openDeps(byId.get(id)!));
+    }
+    return false;
+  };
+  const canJoin = (a: string, b: string) => !reachesViaOther(a, b) && !reachesViaOther(b, a);
+
+  const groups = new Map<string, { id: string; span: number }[]>();
+  for (const t of byId.values()) {
+    if (t.kind !== "code" || isClosed(t) || isGateLike(t) || effectiveSize(t) !== "small") continue;
+    if (hasUnbatchedReason(t)) continue;
+    const span = typeof t.pointer === "string" ? pointerLineSpan(t.pointer) : null;
+    if (span === null) continue;
+    const key = gatesUpstream(t);
+    groups.set(key, [...(groups.get(key) ?? []), { id: t.id as string, span }]);
+  }
+
+  const warnings: string[] = [];
+  for (const members of groups.values()) {
+    if (members.length < 2) continue;
+    // First-fit decreasing: how few PRs could carry this group within the cap?
+    const bins: { ids: string[]; span: number }[] = [];
+    for (const m of [...members].sort((a, b) => b.span - a.span)) {
+      const bin = bins.find((b) => b.span + m.span <= MEGA_TASK_LINE_SPAN && b.ids.every((id) => canJoin(id, m.id)));
+      if (bin) {
+        bin.ids.push(m.id);
+        bin.span += m.span;
+      } else {
+        bins.push({ ids: [m.id], span: m.span });
+      }
+    }
+    if (bins.length < members.length) {
+      const plan = bins.filter((b) => b.ids.length > 1).map((b) => `${b.ids.sort().join(" + ")} (~${b.span} lines)`);
+      warnings.push(
+        `${members.length} light tasks (${members.map((m) => `"${m.id}"`).join(", ")}) wait on the same gates and could ship as ${bins.length} PR(s) instead of ${members.length}: ${plan.join("; ")} — sweep them into multi-section tasks, or add "unbatched": "<reason>" to keep one apart.`,
+      );
+    }
+  }
+  return warnings;
+}
 
 /**
  * Parse the `lines A,B` / `lines A-B` hints out of a pointer → total span, or

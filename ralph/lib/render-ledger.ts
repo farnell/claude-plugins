@@ -16,6 +16,7 @@ interface RenderTask {
   human_gate?: boolean;
   kind?: string;
   batched_into?: string;
+  lane?: string;
 }
 
 interface RenderLedger {
@@ -39,7 +40,10 @@ export function renderLedgerMd(ledger: RenderLedger, jsonPath: string): string {
     const box = t.status === "done" || t.status === "batched" ? "[x]" : "[ ]";
     const deps = t.deps && t.deps.length ? ` (after ${t.deps.join(", ")})` : "";
     // Only non-code kinds are worth a tag: code is the default shape.
-    const kind = t.status !== "done" && t.status !== "batched" && !t.human_gate && t.kind && t.kind !== "code" ? ` · ${t.kind}` : "";
+    const open = t.status !== "done" && t.status !== "batched" && !t.human_gate;
+    const kind = open && t.kind && t.kind !== "code" ? ` · ${t.kind}` : "";
+    // The triage lane of an open code task (1.3.0): light or full.
+    const lane = open && (t.kind ?? "code") === "code" && (t.lane === "light" || t.lane === "full") ? ` · ${t.lane}` : "";
     const tail = t.status === "batched"
       ? ` — ↪ batched into ${t.batched_into ?? "?"}`
       : t.human_gate
@@ -49,7 +53,7 @@ export function renderLedgerMd(ledger: RenderLedger, jsonPath: string): string {
         : t.status === "awaiting_review"
           ? " — 👀 awaiting review"
           : "";
-    lines.push(`- ${box} **${t.id}** ${t.title}${deps}${kind}${tail}`);
+    lines.push(`- ${box} **${t.id}** ${t.title}${deps}${kind}${lane}${tail}`);
   }
   lines.push("");
   return lines.join("\n");

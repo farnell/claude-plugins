@@ -11,10 +11,10 @@ description: Grind ANY feature/roadmap markdown file to completion as a PR pipel
 `/ralph <feature.md> [flags]` turns a feature doc into merged PRs. Per task:
 
 ```
-code:            red → implement → check → review → merge
-code, small:           implement → review → merge                   (size:"small")
-docs / measure:        implement → [blind-check] → review → merge   (verify:"manual" parks for Matt)
-decision / gate: Matt does it; Ralph ticks it itself once its done_when evidence exists
+lane full  (code):  red → implement → check → review → merge
+lane light (code):        implement → review → merge                   (= size:"small")
+docs / measure:           implement → [blind-check] → review → merge   (verify:"manual" parks for Matt)
+lane human (gate):  Matt does it; Ralph ticks it itself once its done_when evidence exists
 ```
 
 (docs/measure review does the check duties itself; `blind-check` runs only for a measure task with
@@ -41,6 +41,23 @@ before anything non-obvious. Every helper is plain node on the plugin, no instal
 
 You do the judgement-heavy bootstrap ONCE (Steps 1–4), then hand off.
 
+## How Ralph decides (you are the manager)
+
+Matt hands you a doc; **you** decide how much machinery each part needs, and only print the
+plan. Never ask him to triage, size or batch: ask only when a gate or decision really needs him.
+
+1. **Triage every task into a lane** (Step 2): `full` for anything where a wrong change costs
+   money, access, data or trust; `light` for everything else that is code; `human` for gates and
+   decisions. A full task costs ~5 fresh agents, a light one ~3, each starting with ~40k tokens
+   of fixed context, so light is the default and full is earned.
+2. **Sweep light work together** into as few tasks as the gates allow (Step 2, batching), and
+   batch related full sections too.
+3. **Shrink a tiny doc to one task.** If after triage there are no `full` tasks and at most two
+   light batches (gates aside), fold everything runnable into ONE task: one fresh implement
+   agent, one review, one PR, through the normal loop. Say so in the plan ("tiny doc: one PR").
+   Never do the work in this session: the loop keeps it reviewable and resumable, and your
+   context doesn't grow.
+
 ## Step 0 — parse the invocation
 
 - `<path.md>`: the feature doc (required unless `--scaffold`). No path → ask which doc.
@@ -54,7 +71,7 @@ You do the judgement-heavy bootstrap ONCE (Steps 1–4), then hand off.
 - `--max N`: maxSteps (default 60; a code task is ~5 steps).
 - `--model X`: the implement-stage model (default `opus`). A task's `Model:` line wins. Red and
   review always run on Opus (reviews are Opus unless Matt says Fable), check on Sonnet; merge is
-  RALPH `merge` relayed by a helper agent, with a Sonnet agent only when it hands a PR back.
+  RALPH `merge` relayed by a Haiku helper agent, with a Sonnet agent only when it hands a PR back.
 - `--dry-run`: derive/refresh + validate the ledger and print the plan (plus what
   `next-step` says is next, if the ledger is already on main); do not land or run anything.
 
@@ -72,7 +89,8 @@ The authoring contract is `${CLAUDE_PLUGIN_ROOT}/docs/authoring-guide.md`. Read 
 yields a clean set: explicit checkboxes → a task table → numbered phases → H2/H3 headings. If
 none do, STOP and ask the user to point at the task list; never fabricate micro-tasks.
 
-Per task: a stable `id`, a short `title`, a **`pointer`** (`<doc> §<heading> — lines A,B`), and
+Per task: a stable `id`, a short `title`, a **`pointer`** (`<doc> §<heading> — lines A,B`), a
+**`lane`** + one-line **`lane_reason`** (Step 2), and
 on every runnable code task **`files`**: the repo-relative paths it is expected to edit, best
 effort from its section (the batching check in Step 2 compares them). A task that batches several
 sections is titled `X and Y (S12 + S13)` with pointer `<doc> §S12 — lines A,B; §S13 — lines C,D`;
@@ -90,33 +108,44 @@ every listed section's acceptance applies.
     check by a subagent"), set `"blind_check": true` so a fresh agent that never saw the grades
     does it. The implement agent can't spawn one and must not self-check.
   - `decision`: Matt chooses. Always `human_gate:true`.
-- **`size`** (code tasks only): `"small"` from a `Size: small` line, or by judgement when every
-  rule holds; otherwise omit it (= standard). A small task skips red and check: about 2 fresh
-  agents instead of 4–5, each of which starts with ~40k tokens of fixed context.
-  **When a code task is `small`** (all of these hold): no migration, no change to core decision
-  logic or a TS↔SQL twin, no new shared source of truth, nothing that writes a live store, about
-  300 changed lines or fewer outside tests, and nothing the addendum lists as never-small.
-  Typical: a CLI flag, a script, an env override, a route that reads an existing table, a guard
-  test. When in doubt it is `standard`: a wrong `small` loses the independent red tests, which
-  have caught real bugs. Print each task's size in the Step 4 plan so Matt can veto one.
+- **`lane`** (required on every runnable code task; set `"ledgerVersion": 3`), plus a one-line
+  `lane_reason`. You decide it; a `Lane:` line in the section wins. The lane sets the size, so
+  don't also write `size` (the validator refuses `full` + `small` and `light` + `standard`):
+  - **`full`** (red → implement → check → review → merge): money, credits, billing or pricing;
+    auth, sessions, tokens or permissions; anything that writes a live store or migrates data
+    (every migration is `full` and its own task; `light` + a migration is an error); time,
+    date or timezone logic; core decision logic or a TS↔SQL twin; a new shared source of
+    truth; security; and whatever the addendum lists as never-light.
+  - **`light`** (implement → review → merge, the old `size: "small"`): UI markup, copy, layout
+    and styling; wiring an existing endpoint or component; removals; a11y attributes; guard
+    tests; CLI flags, scripts, env overrides; a route that only reads an existing table. Use it
+    liberally: its review still reads every line, and the implement agent writes the tests.
+  - **`human`**: every gate and decision (also `human_gate: true`).
+  `docs` / `measure` tasks may omit the lane (they already skip red). The validator warns when a
+  light task's wording looks like full territory (credits, auth, timezone…): look again, and
+  either make it full or keep it light because the change really is only markup.
 - **Batch by default.** A doc section is a unit of spec; a ledger task is a unit of PR, and reviews
   are LLM-run, so big PRs are fine. Group related code sections (same feature area or panel, same
   `files`, or a direct dep chain) into one task covering **up to ~3 sections**, with the
   multi-section title and pointer from Step 1, `files` = the union, `deps` = the union minus the
-  members (drop deps that only serialized them). It is `small` only if every member would be.
+  members (drop deps that only serialized them). It is `light` only if every member would be.
+  **Sweep light work harder:** light sections need not touch the same files to share a PR; put
+  every light section that waits on the same gates into as few tasks as the ~150-line cap
+  allows. The validator warns with a suggested grouping when it sees light tasks that could ship
+  as fewer PRs; act on it.
   Keep a task on its own only when: it carries a migration (or the addendum says never-batch), it
   is a gate/decision or the chain between members crosses one, the kinds differ, the combined
   slice is over ~150 summed lines, or it has a stated `"unbatched": "<reason>"`. The validator
-  **errors** on a same-file dep-linked pair where either is small, and **warns** on a standard
-  pair; a non-empty `unbatched` silences both. Fill `files` on every runnable code task; a small
-  one without `files` warns. See the authoring guide §Batch by default.
+  **errors** on a same-file dep-linked pair where either is light (small), and **warns** on a
+  full pair; a non-empty `unbatched` silences both. Fill `files` on every runnable code task; a
+  light one without `files` warns. See the authoring guide §Batch by default.
 - **`human_gate:true`** for anything a human must own: migration **apply**, live-DB / data writes,
   deploys and release/ship scripts, worker restarts, remote-host runs, flag and env flips, hosting /
   auth / payments settings, any change in another repo (this repo's task waits on it through a
   gate), paid-API spend without an explicit cap, every decision, and everything the addendum adds.
   *Writing* gated code is fine; *applying* it is not. Err toward gating. If one task mixes the
   two, say so and suggest the split. A schema change + its migration is a normal `code` task, but
-  keep it small and on its own; the addendum says what Ralph's merge does with a migration here.
+  keep it on its own, in lane `full`; the addendum says what Ralph's merge does with a migration here.
 - **`done_when`** on every open gate (required; the validator enforces it): the evidence that
   Matt's step has happened, so Ralph ticks the gate itself and **nobody ever ticks the ledger by
   hand**. A `Done when:` line in the section wins; otherwise derive it from what the gate does.
@@ -151,14 +180,15 @@ every listed section's acceptance applies.
 {
   "feature": { "slug": "...", "title": "...", "featureMd": "<path>",
                "verifyCmds": ["<the adapter's typecheck>", "<the adapter's mergeGate>"],
-               "generatedAt": "<today>", "ledgerVersion": 2 },
+               "generatedAt": "<today>", "ledgerVersion": 3 },
   "tasks": [
     { "id": "HG-1", "title": "Ship the API endpoint", "pointer": "<doc> §HG-1 — lines 100,108",
-      "kind": "code", "status": "todo", "deps": [], "human_gate": true, "verify": null,
+      "kind": "code", "lane": "human", "status": "todo", "deps": [], "human_gate": true, "verify": null,
       "done_when": { "type": "prod-includes", "pr": 1601, "repo": "owner/other" },
       "attempts": 0, "commit": null, "notes": "", "updatedAt": null },
     { "id": "E2", "title": "...", "pointer": "<doc> §E2 — lines 115,126",
-      "kind": "code", "size": "small", "status": "todo", "deps": ["HG-1"], "human_gate": false,
+      "kind": "code", "lane": "light", "lane_reason": "settings copy + layout only", "status": "todo",
+      "deps": ["HG-1"], "human_gate": false,
       "files": ["src/lib/foo.ts", "src/lib/foo.test.ts"], "verify": "gate", "attempts": 0, "commit": null, "notes": "", "updatedAt": null }
   ]
 }
@@ -196,7 +226,17 @@ The pipeline reads the ledger **only from `origin/main`** (every task PR ticks i
   with just the two ledger files, then squash-merge
   it once both validators pass (docs-only; no tests to run).
 
-Print the plan: tasks in order, kind, size, which are gated, what runs first.
+Print the plan, one line per task in order — lane, what it covers, why that lane — then what
+runs first and roughly how many PRs:
+
+```
+E2  light  Settings copy + General-tab headings (S8 + S9)   — markup and copy only
+E3  full   Credits balance loader (S10)                     — reads money; red tests earn their keep
+HG-1 human Ship the API endpoint                             — another repo; ticks on prod-includes #1601
+```
+
+Matt doesn't approve it: the plan is information, and the run starts (Step 5) unless he has
+asked for `--dry-run`.
 
 ## Step 5 — run the pipeline
 

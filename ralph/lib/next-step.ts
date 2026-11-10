@@ -65,6 +65,8 @@ export interface LedgerTask {
   blind_check?: boolean;
   /** code only: "small" skips the red and check stages (see SIZES). Absent = "standard". */
   size?: string;
+  /** The triage lane (1.3.0): full | light | human. light = size "small", full = "standard". */
+  lane?: string;
   /** status "batched" only: the task whose PR ships this one's section. */
   batched_into?: string;
 }
@@ -75,6 +77,23 @@ export const SIZES = ["small", "standard"] as const;
 /** True when a task runs the lean code route: no red stage, no check stage. */
 export function isSmallCode(kind: string, size: string | undefined): boolean {
   return kind === "code" && size === "small";
+}
+
+/**
+ * The lanes /ralph triages every task into at derivation (1.3.0, "the manager"):
+ *   full  — the standard code pipeline: red → implement → check → review → merge;
+ *   light — implement → review → merge: the same route as size "small";
+ *   human — a gate or decision: Matt's step, never run.
+ * The lane maps onto the existing machinery: it decides the size, and the
+ * validator refuses a lane that contradicts `size`.
+ */
+export const LANES = ["full", "light", "human"] as const;
+
+/** The size a task actually runs at: its lane wins, else its size, else standard. */
+export function effectiveSize(task: { lane?: unknown; size?: unknown }): "small" | "standard" {
+  if (task.lane === "light") return "small";
+  if (task.lane === "full") return "standard";
+  return task.size === "small" ? "small" : "standard";
 }
 
 export interface LedgerLike {
@@ -256,7 +275,7 @@ export function resolveTask(task: LedgerTask, pr: PrFacts | undefined, done: Set
   const kind = task.kind ?? "code";
   const manual = task.verify === "manual";
   const blindCheck = kind === "measure" && task.blind_check === true;
-  const full = kind === "code" && !isSmallCode(kind, task.size);
+  const full = kind === "code" && !isSmallCode(kind, effectiveSize(task));
   if (!pr) {
     return { action: "run", stage: stageAfter(undefined, full, manual, blindCheck) as Stage, reviewRound: 0, checkFailures: 0, lastEvent: "none", ...NO_RED };
   }
@@ -353,7 +372,7 @@ export function nextStep(ledger: LedgerLike, prs: PrFacts[], skip: Set<string>, 
         kind: task.kind ?? "code",
         verify: task.verify ?? "",
         model: task.model ?? "",
-        size: task.size ?? "standard",
+        size: effectiveSize(task),
         stage: r.stage,
         branch,
         prNumber: pr?.number ?? 0,

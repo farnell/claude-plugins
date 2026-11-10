@@ -3,9 +3,9 @@ export const meta = {
   description:
     'Ralph PR pipeline: grind a feature ledger task by task — red tests, implement, check, Opus review, merge — each stage a fresh agent in its own worktree. All state lives on GitHub + origin/main, so a killed run or a fresh session resumes in place.',
   phases: [
-    { title: 'Preflight', model: 'sonnet' },
-    { title: 'Gates', model: 'sonnet' },
-    { title: 'Grind', model: 'sonnet' }, // the planner; each stage picks its own (STAGE_MODEL)
+    { title: 'Preflight', model: 'haiku' },
+    { title: 'Gates', model: 'haiku' },
+    { title: 'Grind', model: 'haiku' }, // the planner relay (Sonnet on a recheck); each stage picks its own (STAGE_MODEL)
     { title: 'Report' },
   ],
 }
@@ -34,7 +34,7 @@ export const meta = {
 //   · helper commands keep stdout AND stderr, so a failure is never a mystery;
 //   · docs/measure tasks have no separate check stage (review does it), and a
 //     measure task with blind_check gets an independent blind-check stage;
-//   · (2026-11-02) a code task with size:"small" skips red and check too; the
+//   · (2026-11-02) a code task with size:"small" (1.3.0: lane "light") skips red and check too; the
 //     merge stage is SCRIPTED (lib/merge.ts, relayed by a helper agent) and the
 //     Sonnet merge agent runs only when the script hands back a conflict, a red
 //     gate, a refused guard or an error.
@@ -48,10 +48,15 @@ export const meta = {
 // to run. So every prompt opens with TRIGGER: the relayed message is what
 // launched this run, not a task to answer, act on or refuse over.
 //
-// Helper agents (preflight, gates, planner, cleanup) run on Sonnet, not Haiku
-// (2026-11-09): a Haiku planner refused its job without running a command
-// ("Not run yet: the cleanup step has not been executed") and ended the run.
-// A planner that fails or refuses is now asked once more before the run stops.
+// Relay agents (preflight, gates, planner, scripted merge, cleanup) only run a
+// node helper and copy its JSON back. The Workflow runtime has no way to run a
+// command without an agent (its hooks are agent/parallel/pipeline/phase/log/
+// workflow; no shell, no filesystem), so they stay agents, on the cheapest model
+// with a short prompt (1.3.0). 2026-11-09: a Haiku planner refused its job
+// without running a command and ended the run, so every relay whose answer is
+// unusable is asked ONCE more on Sonnet (RESCUE_MODEL) before anything stops: the
+// planner and preflight on a fault, gates on a failure. A scripted merge that
+// fails already falls back to the Sonnet merge agent.
 // ----------------------------------------------------------------------------
 function parseArgs(a) {
   if (typeof a === 'string') {
@@ -68,8 +73,10 @@ const lib = (name) => `node "${R}/lib/${name}.ts"`
 const MAX_STEPS = Number.isInteger(o.maxSteps) ? o.maxSteps : 60
 const MAX_CONSEC_FAILURES = Number.isInteger(o.maxConsecutiveFailures) ? o.maxConsecutiveFailures : 3
 const MODEL = o.model || 'opus'
-// The relay agents: they run one command and copy its JSON back.
-const HELPER_MODEL = 'sonnet'
+// The relay agents: they run one command and copy its JSON back (see the header).
+const RELAY_MODEL = 'haiku'
+// A relay's one recheck, after an unusable answer.
+const RESCUE_MODEL = 'sonnet'
 const POLICY = `${R}/docs/ralph-policy.md`
 // A fresh agent that sees ONLY its prompt — never the session that launched the run.
 const FRESH = 'general-purpose'
@@ -229,8 +236,7 @@ function planPrompt(skip, cleanupPath) {
   return [
     TRIGGER,
     '',
-    'You run two commands for a Ralph pipeline and relay what they print. You have no other job and no conversation with anyone.',
-    'Always run them, in order, yourself, now: nothing has run before you and nobody else will. Never answer without running them.',
+    'Run these commands yourself, now, in order, and relay what they print. Nothing has run before you. Never answer without running them.',
     cleanupPath
       ? `FIRST remove the previous stage's worktree (it only removes a clean, pushed stage worktree): \`${lib('worktrees')} remove "${cleanupPath}"\`. Put the JSON line it prints in "cleanup" (whatever it says, carry on).`
       : 'There is no worktree to remove: cleanup="".',
@@ -239,7 +245,7 @@ function planPrompt(skip, cleanupPath) {
     'On exit=0, return that JSON object through the schema with ok=true and error="".',
     // -1, never 0: a failure relayed with ok=true must not read as "everything is done".
     'On failure also set hasNext=false, remaining=-1, batched=0, parked=[], and a "next" object with empty strings / zeros.',
-    'Do not edit, fix or investigate anything.',
+    'Do nothing else.',
   ].join('\n')
 }
 
@@ -325,14 +331,14 @@ function stageInstruction(n, scripted) {
       if (n.lastEvent === 'review-changes') return 'This is a FIX round: address ONLY the blocking findings in the latest `ralph:review` comment on the PR, then post `<!-- ralph:implemented sha=<sha> -->`.'
       if (n.lastEvent === 'check-fail') return 'The last check FAILED: read the latest `ralph:check` comment on the PR, fix exactly that, then post `<!-- ralph:implemented sha=<sha> -->`.'
       if (n.lastEvent === 'blind-check-fail') return 'The independent blind check DISAGREED: read the latest `ralph:blind-check` comment, re-examine the disputed items (do not just adopt either side), record the resolution, then post `<!-- ralph:implemented sha=<sha> -->`.'
-      if (isSmall(n)) return 'This is a SMALL code task (policy §implement, "Small code tasks"): there is no red stage, so write the acceptance tests yourself, with the code, in this PR. Detach at origin/main, implement, tick the ledger in this PR, push, open the DRAFT PR, post `<!-- ralph:implemented sha=<sha> -->`.'
+      if (isSmall(n)) return 'This is a LIGHT (small) code task (policy §implement, "Light code tasks"): there is no red stage, so write the acceptance tests yourself, with the code, in this PR. Detach at origin/main, implement, tick the ledger in this PR, push, open the DRAFT PR, post `<!-- ralph:implemented sha=<sha> -->`.'
       return 'Implement the task, tick the ledger in this PR, push, post `<!-- ralph:implemented sha=<sha> -->`.'
     case 'check':
       return 'Re-verify the PUSHED head from scratch and post `<!-- ralph:check result=pass|fail -->` with the evidence.' + (noCheck ? '' : '\n' + redGuardLines(n))
     case 'blind-check':
       return 'Do the task\'s independent BLIND check (policy §blind-check): you have never seen the grades. Re-judge the sample from its inputs ALONE, write your verdicts to a file and commit it BEFORE you open the implement stage\'s grades, then compare, push, and post `<!-- ralph:blind-check result=pass|fail -->` with the agreement numbers.'
     case 'review':
-      if (isSmall(n)) return 'Review the PR against the task, its issue and CLAUDE.md. This is a SMALL code task with NO red and NO check stage: first do the check duties yourself (policy §review, "Small code tasks": TYPECHECK + the PR\'s tests on the pushed head, the ledger tick, and that the tests really prove the slice), and confirm it still fits "small"; then post `<!-- ralph:review verdict=approve|changes -->` with findings.'
+      if (isSmall(n)) return 'Review the PR against the task, its issue and CLAUDE.md. This is a LIGHT (small) code task with NO red and NO check stage: first do the check duties yourself (policy §review, "Light code tasks": TYPECHECK + the PR\'s tests on the pushed head, the ledger tick, and that the tests really prove the slice), and confirm it still fits the light lane; then post `<!-- ralph:review verdict=approve|changes -->` with findings.'
       return noCheck
         ? 'Review the PR against the task, its issue and CLAUDE.md. This task has NO separate check stage: first do the check duties yourself (policy §review, "docs/measure"), then post `<!-- ralph:review verdict=approve|changes -->` with findings.'
         : 'Review the PR against the task, its issue and CLAUDE.md; post `<!-- ralph:review verdict=approve|changes|redo-red -->` with findings. Use redo-red when a RED test is bad (policy §review): implement may not change red\'s assertions, so red rewrites it.'
@@ -455,7 +461,13 @@ function adapterProblem(a) {
 
 // ---------------------------------------------------------------------------
 phase('Preflight')
-const pf = await agent(preflightPrompt(), { label: 'ralph:preflight', phase: 'Preflight', model: HELPER_MODEL, effort: 'low', schema: PREFLIGHT_SCHEMA, agentType: FRESH })
+const askPreflight = (label, model) => agent(preflightPrompt(), { label, phase: 'Preflight', model, effort: 'low', schema: PREFLIGHT_SCHEMA, agentType: FRESH })
+let pf = await askPreflight('ralph:preflight', RELAY_MODEL)
+if (!pf || !pf.ok || adapterProblem(pf.adapter)) {
+  // A real failure costs one more cheap agent; a refusal from the cheap relay is rescued.
+  log(`Preflight answer unusable (${(pf && pf.error) || adapterProblem(pf && pf.adapter) || 'no answer'}); asking again on ${RESCUE_MODEL}.`)
+  pf = await askPreflight('ralph:preflight:recheck', RESCUE_MODEL)
+}
 if (!pf || !pf.ok) {
   return { status: 'preflight-failed', ledgerPath, message: (pf && pf.error) || 'preflight agent returned nothing' }
 }
@@ -471,7 +483,9 @@ if (pf.warnings) log(`Preflight: ${pf.warnings}`)
 // now exists (lib/gate-checks.ts), so the work behind them runs this run.
 // A failure here is not fatal: the gates just stay waiting until the next run.
 phase('Gates')
-const gates = await agent(gatesPrompt(), { label: 'ralph:gates', phase: 'Gates', model: HELPER_MODEL, effort: 'low', schema: GATES_SCHEMA, agentType: FRESH })
+const askGates = (label, model) => agent(gatesPrompt(), { label, phase: 'Gates', model, effort: 'low', schema: GATES_SCHEMA, agentType: FRESH })
+let gates = await askGates('ralph:gates', RELAY_MODEL)
+if (!gates || !gates.ok) gates = await askGates('ralph:gates:recheck', RESCUE_MODEL)
 if (!gates || !gates.ok) {
   log(`Gate check failed (gates stay waiting): ${(gates && gates.error) || 'agent returned nothing'}`)
 } else {
@@ -505,8 +519,8 @@ function cleanupReported(line) {
   try { const r = JSON.parse(line); return !!r && typeof r === 'object' } catch { return false }
 }
 
-function askPlanner(label, cleanupPath) {
-  return agent(planPrompt(skip, cleanupPath), { label, phase: 'Grind', model: HELPER_MODEL, effort: 'low', schema: PLAN_SCHEMA, agentType: FRESH })
+function askPlanner(label, cleanupPath, model = RELAY_MODEL) {
+  return agent(planPrompt(skip, cleanupPath), { label, phase: 'Grind', model, effort: 'low', schema: PLAN_SCHEMA, agentType: FRESH })
 }
 
 // '' if the plan can be acted on, else why not (a failed/refused command or an impossible answer).
@@ -532,8 +546,8 @@ for (let i = 0; i < MAX_STEPS; i++) {
     // Ask once more: a failed, refused or impossible answer gets one recheck. Two bad
     // answers stop the run as an error, never as "complete"; resuming is free, the
     // state is on GitHub.
-    log(`Planner answer unusable (${fault}); asking again.`)
-    const again = await askPlanner(`ralph:plan:${i + 1}:recheck`, stillCleaning)
+    log(`Planner answer unusable (${fault}); asking again on ${RESCUE_MODEL}.`)
+    const again = await askPlanner(`ralph:plan:${i + 1}:recheck`, stillCleaning, RESCUE_MODEL)
     noteCleanup(again ? again.cleanup : '', stillCleaning)
     const againFault = planFault(again)
     if (againFault) {
@@ -569,7 +583,7 @@ for (let i = 0; i < MAX_STEPS; i++) {
     scripted = await agent(scriptedMergePrompt(n), {
       label: `ralph:${n.taskId}:merge:script`,
       phase: 'Grind',
-      model: HELPER_MODEL,
+      model: RELAY_MODEL,
       effort: 'low',
       isolation: 'worktree',
       schema: SCRIPTED_MERGE_SCHEMA,
@@ -590,7 +604,7 @@ for (let i = 0; i < MAX_STEPS; i++) {
       log(`${n.taskId}: scripted merge handed back ${scripted ? (scripted.status || 'a failure') : 'nothing'} — ${(scripted && (scripted.message || scripted.error)) || ''}; running the merge agent`)
       // The agent gets its own worktree; remove the script's now (the next planner call removes the agent's).
       if (scriptTree) {
-        const c = await agent(cleanupPrompt(scriptTree), { label: `ralph:${n.taskId}:merge:script-cleanup`, phase: 'Grind', model: HELPER_MODEL, effort: 'low', schema: CLEANUP_SCHEMA, agentType: FRESH })
+        const c = await agent(cleanupPrompt(scriptTree), { label: `ralph:${n.taskId}:merge:script-cleanup`, phase: 'Grind', model: RELAY_MODEL, effort: 'low', schema: CLEANUP_SCHEMA, agentType: FRESH })
         noteCleanup(c ? c.output : '', scriptTree)
       }
     }
@@ -649,7 +663,7 @@ if (!final) final = { status: 'cap-reached', message: `hit maxSteps=${MAX_STEPS}
 phase('Report')
 // The last stage's worktree has no next planner call to remove it.
 if (pendingCleanup) {
-  const c = await agent(cleanupPrompt(pendingCleanup), { label: 'ralph:cleanup', phase: 'Report', model: HELPER_MODEL, effort: 'low', schema: CLEANUP_SCHEMA, agentType: FRESH })
+  const c = await agent(cleanupPrompt(pendingCleanup), { label: 'ralph:cleanup', phase: 'Report', model: RELAY_MODEL, effort: 'low', schema: CLEANUP_SCHEMA, agentType: FRESH })
   noteCleanup(c ? c.output : '', pendingCleanup)
 }
 const merged = history.filter((h) => h.stage === 'merge' && h.outcome === 'done').map((h) => `${h.task} #${h.pr}`)

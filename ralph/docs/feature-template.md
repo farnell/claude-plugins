@@ -12,7 +12,9 @@
     • EVERY non-gated task has a `Kind:` line (code | docs | measure | decision)
       and a `Verify:` line — a concrete command, or `gate` (the typecheck + its
       red tests; code only), or `manual` (Matt reads + merges the PR; never for code);
-    • a small, low-risk code task can add `Size: small` (no red, no check stage);
+    • Ralph triages each code task itself: lane `full` (red tests first) for
+      money/auth/data/migrations/time zones/security, `light` (no red, no check
+      stage) for UI, copy, wiring and removals; add `Lane: full|light` to override;
     • keep each section small; Ralph BATCHES related code sections (same area,
       same files, a dep chain) into one PR of up to ~3 sections. Say "keep
       separate: <reason>" on a section that must be its own PR (a migration

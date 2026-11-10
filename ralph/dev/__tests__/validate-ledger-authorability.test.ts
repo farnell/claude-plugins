@@ -748,3 +748,103 @@ describe("span cap — a sensible 2–3 section batch does not warn", () => {
     expect(res.warnings.filter((w) => w.includes("spans ~"))).toEqual([]);
   });
 });
+
+describe("lanes (1.3.0)", () => {
+  const v3 = (tasks: unknown[]) => ({ feature: { verifyCmds: ["npx tsc --noEmit", "pnpm test"], ledgerVersion: 3 }, tasks });
+  const lt = (id: string, over: Record<string, unknown> = {}) => ({
+    ...task({ id, title: `tweak ${id}`, pointer: `docs/x.md §${id} — lines 1,20` }),
+    lane: "light",
+    lane_reason: "UI markup only",
+    files: [`src/${id}.tsx`],
+    deps: [],
+    ...over,
+  });
+  const has = (list: string[], re: RegExp) => list.some((x) => re.test(x));
+
+  it("requires a lane on a runnable code task in a v3 ledger, not on an old one, a done task or a gate", () => {
+    const noLane = { ...lt("A"), lane: undefined };
+    expect(has(validateLedgerAuthorability(v3([noLane])).errors, /has no "lane"/)).toBe(true);
+    expect(has(validateLedgerAuthorability(ledger([noLane])).errors, /has no "lane"/)).toBe(false);
+    expect(has(validateLedgerAuthorability(v3([{ ...noLane, status: "done" }])).errors, /has no "lane"/)).toBe(false);
+    expect(validateLedgerAuthorability(v3([task({ id: "G", human_gate: true })])).ok).toBe(true);
+  });
+
+  it("refuses an unknown lane", () => {
+    expect(has(validateLedgerAuthorability(v3([lt("A", { lane: "medium" })])).errors, /unknown "lane"/)).toBe(true);
+  });
+
+  it("human is for gates only, and a gate is only human", () => {
+    expect(has(validateLedgerAuthorability(v3([lt("A", { lane: "human" })])).errors, /lane:"human" but is not a human gate/)).toBe(true);
+    const gate = { ...task({ id: "G", human_gate: true }), lane: "light" };
+    expect(has(validateLedgerAuthorability(v3([gate])).errors, /a gate is always lane "human"/)).toBe(true);
+    expect(validateLedgerAuthorability(v3([{ ...task({ id: "G", human_gate: true }), lane: "human" }])).ok).toBe(true);
+  });
+
+  it("full + size small, and light + size standard, contradict", () => {
+    expect(has(validateLedgerAuthorability(v3([lt("A", { lane: "full", size: "small" })])).errors, /lane:"full" and size:"small"/)).toBe(true);
+    expect(has(validateLedgerAuthorability(v3([lt("A", { size: "standard" })])).errors, /lane:"light" and size:"standard"/)).toBe(true);
+    expect(validateLedgerAuthorability(v3([lt("A", { size: "small" })])).ok).toBe(true);
+  });
+
+  it("full is for code tasks only", () => {
+    const docsFull = { ...lt("D", { lane: "full" }), kind: "docs", verify: "test -f docs/x.md" };
+    expect(has(validateLedgerAuthorability(v3([docsFull])).errors, /lane:"full" but is a docs task/)).toBe(true);
+  });
+
+  it("light + a migration is an error (by files or by title)", () => {
+    expect(has(validateLedgerAuthorability(v3([lt("A", { files: ["drizzle/0042_add_col.sql"] })])).errors, /adds a migration/)).toBe(true);
+    expect(has(validateLedgerAuthorability(v3([lt("A", { files: ["src/db/migrations/1.ts"] })])).errors, /adds a migration/)).toBe(true);
+    expect(has(validateLedgerAuthorability(v3([lt("A", { title: "Add the plan column + migration" })])).errors, /adds a migration/)).toBe(true);
+    expect(has(validateLedgerAuthorability(v3([lt("A", { lane: "full", title: "Add the plan column + migration" })])).errors, /adds a migration/)).toBe(false);
+  });
+
+  it("warns when a light task's wording looks like full-lane territory", () => {
+    const res = validateLedgerAuthorability(v3([lt("A", { title: "Show the credits balance" })]));
+    expect(res.ok).toBe(true);
+    expect(has(res.warnings, /looks like full-lane territory/)).toBe(true);
+    expect(has(validateLedgerAuthorability(v3([lt("A")])).warnings, /full-lane territory/)).toBe(false);
+  });
+
+  it("warns on a lane with no lane_reason", () => {
+    expect(has(validateLedgerAuthorability(v3([lt("A", { lane_reason: "" })])).warnings, /no "lane_reason"/)).toBe(true);
+  });
+
+  it("a light lane counts as small for the same-file batching error", () => {
+    const res = validateLedgerAuthorability(v3([lt("A", { files: ["src/m.tsx"] }), lt("B", { files: ["src/m.tsx"], deps: ["A"] })]));
+    expect(has(res.errors, /tasks "A" and "B" both edit/)).toBe(true);
+  });
+
+  describe("sweeping light tasks into fewer PRs (warning)", () => {
+    const sweep = (res: { warnings: string[] }) => res.warnings.filter((w) => w.includes("light tasks"));
+
+    it("unrelated light tasks with no gates upstream, within the cap, could share a PR", () => {
+      const w = sweep(validateLedgerAuthorability(v3([lt("A"), lt("B"), lt("C")])));
+      expect(w).toHaveLength(1);
+      expect(w[0]).toMatch(/3 light tasks .* could ship as 1 PR\(s\) instead of 3/);
+      expect(w[0]).toMatch(/A \+ B \+ C \(~57 lines\)/);
+    });
+
+    it("respects the ~150-line cap", () => {
+      const big = (id: string) => lt(id, { pointer: `docs/x.md §${id} — lines 1,100` });
+      expect(sweep(validateLedgerAuthorability(v3([big("A"), big("B")])))).toEqual([]);
+    });
+
+    it("never sweeps across a gate: tasks waiting on different gates stay apart", () => {
+      const gate = { ...task({ id: "G", human_gate: true }), lane: "human" };
+      expect(sweep(validateLedgerAuthorability(v3([gate, lt("A"), lt("B", { deps: ["G"] })])))).toEqual([]);
+      // Both after the same gate: fine to sweep.
+      expect(sweep(validateLedgerAuthorability(v3([gate, lt("A", { deps: ["G"] }), lt("B", { deps: ["G"] })])))).toHaveLength(1);
+    });
+
+    it("never sweeps two light tasks with a non-member task between them", () => {
+      const full = { ...lt("F", { lane: "full", deps: ["A"] }) };
+      expect(sweep(validateLedgerAuthorability(v3([lt("A"), full, lt("B", { deps: ["F"] })])))).toEqual([]);
+    });
+
+    it("skips full tasks, done tasks and tasks with an unbatched reason", () => {
+      expect(sweep(validateLedgerAuthorability(v3([lt("A"), lt("B", { lane: "full" })])))).toEqual([]);
+      expect(sweep(validateLedgerAuthorability(v3([lt("A"), lt("B", { status: "done" })])))).toEqual([]);
+      expect(sweep(validateLedgerAuthorability(v3([lt("A"), lt("B", { unbatched: "ships behind a flag" })])))).toEqual([]);
+    });
+  });
+});
