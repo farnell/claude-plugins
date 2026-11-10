@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   validateLedgerAuthorability,
   runCli,
+  pointerLineSpan,
   type AuthorabilityLedgerLike,
 } from "../../lib/validate-ledger-authorability.ts";
 
@@ -514,5 +515,177 @@ describe("validateLedgerAuthorability — blind_check", () => {
   it("refuses a non-boolean blind_check", () => {
     const t = { ...task({ kind: "measure", verify: "manual" }), blind_check: "yes" };
     expect(validateLedgerAuthorability(ledger([t])).ok).toBe(false);
+  });
+});
+
+describe("validateLedgerAuthorability — batching of small same-file neighbours", () => {
+  // A code task with files/deps/size/unbatched, valid on its own.
+  function ct(
+    id: string,
+    over: { files?: unknown; deps?: string[]; size?: string; status?: string; unbatched?: unknown; human_gate?: boolean; kind?: string } = {},
+  ) {
+    const t: Record<string, unknown> = {
+      ...task({ id, title: `task ${id}`, pointer: `docs/x.md §${id} — lines 1,10`, status: over.status ?? "todo", human_gate: over.human_gate, kind: over.kind ?? "code" }),
+      deps: over.deps ?? [],
+    };
+    if ("files" in over) t.files = over.files;
+    if (over.size !== undefined) t.size = over.size;
+    if ("unbatched" in over) t.unbatched = over.unbatched;
+    return t;
+  }
+  const MODAL = "src/components/settings/settings-modal.tsx";
+  const batchErrors = (res: { errors: string[] }) => res.errors.filter((e) => e.includes("merge them into one task"));
+
+  it("errors on a direct dep: small task sharing a file with the task it depends on", () => {
+    const res = validateLedgerAuthorability(
+      ledger([ct("S1", { files: [MODAL] }), ct("S2", { files: [MODAL, "src/x.ts"], deps: ["S1"], size: "small" })]),
+    );
+    expect(res.ok).toBe(false);
+    const errs = batchErrors(res);
+    expect(errs).toHaveLength(1);
+    expect(errs[0]).toContain('"S1"');
+    expect(errs[0]).toContain('"S2"');
+    expect(errs[0]).toContain(MODAL);
+    expect(errs[0]).not.toContain("src/x.ts");
+    expect(errs[0]).toContain("unbatched");
+  });
+
+  it("errors when the earlier task is the small one", () => {
+    const res = validateLedgerAuthorability(
+      ledger([ct("S1", { files: [MODAL], size: "small" }), ct("S2", { files: [MODAL], deps: ["S1"] })]),
+    );
+    expect(batchErrors(res)).toHaveLength(1);
+  });
+
+  it("errors on a transitive dep through an unrelated task", () => {
+    const res = validateLedgerAuthorability(
+      ledger([
+        ct("S1", { files: [MODAL] }),
+        ct("S2", { files: ["src/other.ts"], deps: ["S1"] }),
+        ct("S3", { files: ["./" + MODAL], deps: ["S2"], size: "small" }),
+      ]),
+    );
+    const errs = batchErrors(res);
+    expect(errs).toHaveLength(1);
+    expect(errs[0]).toContain('"S1"');
+    expect(errs[0]).toContain('"S3"');
+  });
+
+  it("no error when the two tasks share no file", () => {
+    const res = validateLedgerAuthorability(
+      ledger([ct("S1", { files: [MODAL] }), ct("S2", { files: ["src/x.ts"], deps: ["S1"], size: "small" })]),
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("no error when neither task is small", () => {
+    const res = validateLedgerAuthorability(
+      ledger([ct("S1", { files: [MODAL] }), ct("S2", { files: [MODAL], deps: ["S1"], size: "standard" })]),
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("no error when the tasks are not connected by deps", () => {
+    const res = validateLedgerAuthorability(
+      ledger([ct("S1", { files: [MODAL] }), ct("S2", { files: [MODAL], size: "small" })]),
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("no error when one of them is done", () => {
+    const res = validateLedgerAuthorability(
+      ledger([ct("S1", { files: [MODAL], status: "done" }), ct("S2", { files: [MODAL], deps: ["S1"], size: "small" })]),
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("no error when the dep path runs through a human gate (the gate must happen between them)", () => {
+    const res = validateLedgerAuthorability(
+      ledger([
+        ct("S1", { files: [MODAL] }),
+        ct("G1", { deps: ["S1"], human_gate: true }),
+        ct("S2", { files: [MODAL], deps: ["G1"], size: "small" }),
+      ]),
+    );
+    expect(batchErrors(res)).toEqual([]);
+  });
+
+  it("no error when either task carries an unbatched reason", () => {
+    for (const where of ["later", "earlier"] as const) {
+      const reason = { unbatched: "S1 ships behind a flag Matt flips first" };
+      const res = validateLedgerAuthorability(
+        ledger([
+          ct("S1", { files: [MODAL], ...(where === "earlier" ? reason : {}) }),
+          ct("S2", { files: [MODAL], deps: ["S1"], size: "small", ...(where === "later" ? reason : {}) }),
+        ]),
+      );
+      expect(res.ok, where).toBe(true);
+    }
+  });
+
+  it("still errors when unbatched is an empty (or blank) string", () => {
+    for (const unbatched of ["", "   "]) {
+      const res = validateLedgerAuthorability(
+        ledger([ct("S1", { files: [MODAL] }), ct("S2", { files: [MODAL], deps: ["S1"], size: "small", unbatched })]),
+      );
+      const errs = batchErrors(res);
+      expect(errs).toHaveLength(1);
+      expect(errs[0]).toContain("empty");
+    }
+  });
+
+  it("errors on a non-string unbatched or a malformed files", () => {
+    const res = validateLedgerAuthorability(
+      ledger([ct("S1", { files: "src/a.ts", unbatched: true })]),
+    );
+    expect(res.errors.some((e) => e.includes('malformed "files"'))).toBe(true);
+    expect(res.errors.some((e) => e.includes('non-string "unbatched"'))).toBe(true);
+  });
+
+  it("warns (does not error) on a runnable small code task with no files", () => {
+    for (const files of [undefined, []]) {
+      const res = validateLedgerAuthorability(ledger([ct("S1", { size: "small", ...(files ? { files } : {}) })]));
+      expect(res.ok).toBe(true);
+      expect(res.warnings.some((w) => w.includes('task "S1"') && w.includes('no "files"'))).toBe(true);
+    }
+  });
+
+  it("no files warning on a standard, done, or files-bearing small task", () => {
+    const res = validateLedgerAuthorability(
+      ledger([
+        ct("S1"),
+        ct("S2", { size: "small", status: "done" }),
+        ct("S3", { size: "small", files: [MODAL] }),
+      ]),
+    );
+    expect(res.warnings.filter((w) => w.includes('no "files"'))).toEqual([]);
+  });
+});
+
+describe("pointerLineSpan — multi-section pointers", () => {
+  it("reads a single range", () => {
+    expect(pointerLineSpan("docs/x.md §S1 — lines 10,30")).toBe(20);
+    expect(pointerLineSpan("docs/x.md §S1 — lines 10-30")).toBe(20);
+  });
+
+  it("sums every range of a multi-section pointer", () => {
+    expect(pointerLineSpan("docs/x.md §S12 — lines 10,30; §S13 — lines 40,55")).toBe(35);
+  });
+
+  it("returns null when there is no line hint", () => {
+    expect(pointerLineSpan("docs/x.md §S1")).toBeNull();
+  });
+
+  it("warns on a multi-section task whose ranges together are a mega-task, but not on one that is small together", () => {
+    const big = validateLedgerAuthorability(
+      ledger([task({ id: "T1", pointer: "docs/x.md §S12 — lines 10,100; §S13 — lines 200,290" })]),
+    );
+    expect(big.warnings.some((w) => w.includes("spans ~180 lines"))).toBe(true);
+    // The old first-range-only parse would also pass this; the far-apart second
+    // section must not be read as one giant 10→400 range.
+    const small = validateLedgerAuthorability(
+      ledger([task({ id: "T1", pointer: "docs/x.md §S12 — lines 10,20; §S13 — lines 390,400" })]),
+    );
+    expect(small.warnings.filter((w) => w.includes("spans"))).toEqual([]);
   });
 });

@@ -21,11 +21,17 @@
 //                  `decision`, `code` + "manual", or `docs`/`measure` + "gate",
 //                · an unambiguous apply/deploy command in a non-gated task,
 //                · an open gate without a valid `done_when` (gate-checks.ts),
-//                  or a `done_when` on a task that is not a gate.
+//                  or a `done_when` on a task that is not a gate,
+//                · an unbatched same-file pair: two runnable code tasks, at
+//                  least one small, that share a path in `files` and where one
+//                  depends on the other (directly or transitively) — merge
+//                  them into one task, or justify with `unbatched: "<reason>"`.
 //   warnings[] — ADVISORY. Heuristic / false-positive-prone (never blocks):
 //                · a task whose slice spans many lines (likely an and-joined
 //                  mega-task worth splitting),
-//                · soft prod-touching wording that should probably be gated.
+//                · soft prod-touching wording that should probably be gated,
+//                · a runnable small code task with no `files` (the batching
+//                  check can't compare it with its neighbours).
 //
 // Wired into the same two points as the dep validator: the /ralph skill
 // (derivation time) and the ralph-loop workflow preflight.
@@ -72,6 +78,11 @@ export interface AuthorabilityTaskLike {
   done_when?: unknown;
   blind_check?: unknown;
   size?: unknown;
+  deps?: unknown;
+  /** Repo-relative paths the task expects to edit (code tasks; feeds the batching check). */
+  files?: unknown;
+  /** Why this task must stay a separate PR from a same-file neighbour (escape hatch for the batching check). */
+  unbatched?: unknown;
 }
 
 export interface AuthorabilityLedgerLike {
@@ -292,6 +303,23 @@ export function validateLedgerAuthorability(
       }
     }
 
+    // ---- files / unbatched (shape; the batching check runs after the loop) ----
+    if (obj.files !== undefined && !isStringArray(obj.files)) {
+      errors.push(
+        `${label} has a malformed "files" (${describeType(obj.files)}) — use an array of repo-relative paths the task edits.`,
+      );
+    }
+    if (obj.unbatched !== undefined && typeof obj.unbatched !== "string") {
+      errors.push(
+        `${label} has a non-string "unbatched" (${describeType(obj.unbatched)}) — use a reason string, or omit it.`,
+      );
+    }
+    if (runnable && kind === "code" && obj.size === "small" && filesOf(obj).length === 0) {
+      warnings.push(
+        `${label} is a small code task with no "files" — list the repo paths it edits so the batching check can compare it with its same-file neighbours.`,
+      );
+    }
+
     // ---- verify declaration (the core authorability check) ----
     const verify = obj.verify;
     if (gated) {
@@ -345,21 +373,112 @@ export function validateLedgerAuthorability(
     }
   });
 
+  errors.push(...batchingErrors(rawTasks as AuthorabilityTaskLike[]));
+
   return { ok: errors.length === 0, errors, warnings };
+}
+
+// ---------------------------------------------------------------------------
+// Batching: tiny same-file neighbours are one task, not a chain of PRs.
+//
+// 2026-11-10: a derived ledger left "remove the Usage tab" and a small "remove
+// a chip" — both in the same component, the second depending on the first — as
+// two PRs. Every task costs ~3–5 fresh agents, each starting with ~40k tokens
+// of fixed context, so a small task chained behind a same-file neighbour is
+// waste the skill's advice ("batch tiny neighbours") didn't prevent. This makes
+// it mechanical.
+//
+// The rule: two runnable (not done, not gated) `code` tasks, at least one of
+// them `size: "small"`, that share a path in `files`, where one reaches the
+// other through `deps` (direct or transitive) → error. A dep path that runs
+// through a human gate / decision is not counted: the gate has to happen
+// between them, so they can't be one PR. Escape hatch: either task carries a
+// non-empty `unbatched` reason.
+// ---------------------------------------------------------------------------
+
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every((x) => typeof x === "string");
+}
+
+/** A task's `files`, normalised (trimmed, no leading "./", empties dropped). */
+function filesOf(t: AuthorabilityTaskLike): string[] {
+  if (!isStringArray(t.files)) return [];
+  return t.files.map((f) => f.trim().replace(/^\.\//, "")).filter(Boolean);
+}
+
+function hasUnbatchedReason(t: AuthorabilityTaskLike): boolean {
+  return typeof t.unbatched === "string" && t.unbatched.trim() !== "";
+}
+
+function isGateLike(t: AuthorabilityTaskLike): boolean {
+  return t.human_gate === true || t.kind === "decision";
+}
+
+function batchingErrors(tasks: AuthorabilityTaskLike[]): string[] {
+  const errors: string[] = [];
+  const byId = new Map<string, AuthorabilityTaskLike>();
+  for (const t of tasks) {
+    if (t && typeof t.id === "string" && t.id !== "" && !byId.has(t.id)) byId.set(t.id, t);
+  }
+  const depsOf = (t: AuthorabilityTaskLike): string[] =>
+    Array.isArray(t.deps) ? t.deps.filter((d): d is string => typeof d === "string") : [];
+  const candidate = (t: AuthorabilityTaskLike | undefined): t is AuthorabilityTaskLike =>
+    !!t && t.kind === "code" && t.status !== "done" && !isGateLike(t);
+
+  for (const later of byId.values()) {
+    if (!candidate(later)) continue;
+    const laterFiles = filesOf(later);
+    if (laterFiles.length === 0) continue;
+
+    // Every task `later` reaches through deps, not walking through a gate.
+    const seen = new Set<string>([later.id as string]);
+    const stack = depsOf(later);
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const earlier = byId.get(id);
+      if (!earlier || isGateLike(earlier)) continue;
+      stack.push(...depsOf(earlier));
+
+      if (!candidate(earlier)) continue;
+      if (later.size !== "small" && earlier.size !== "small") continue;
+      const earlierFiles = new Set(filesOf(earlier));
+      const shared = [...new Set(laterFiles)].filter((f) => earlierFiles.has(f));
+      if (shared.length === 0) continue;
+      if (hasUnbatchedReason(later) || hasUnbatchedReason(earlier)) continue;
+
+      const emptyReason =
+        later.unbatched !== undefined || earlier.unbatched !== undefined
+          ? ' An empty "unbatched" is not a reason.'
+          : "";
+      errors.push(
+        `tasks "${earlier.id}" and "${later.id}" both edit ${shared.map((f) => `"${f}"`).join(", ")} and "${later.id}" depends on "${earlier.id}", with at least one of them size:"small" — merge them into one task (one PR; its pointer can list both sections), or add "unbatched": "<reason>" to say why they must be separate PRs.${emptyReason}`,
+      );
+    }
+  }
+  return errors;
 }
 
 // A slice bigger than this many lines probably bundles more than one unit of
 // work. Conservative on purpose — this is a warning, not a block.
 const MEGA_TASK_LINE_SPAN = 150;
 
-/** Parse a `lines A,B` / `lines A-B` hint out of a pointer → span (B-A), or null. */
-function pointerLineSpan(pointer: string): number | null {
-  const m = pointer.match(/lines?\s+(\d+)\s*[,\-–]\s*(\d+)/i);
-  if (!m) return null;
-  const a = Number(m[1]);
-  const b = Number(m[2]);
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
-  return Math.abs(b - a);
+/**
+ * Parse the `lines A,B` / `lines A-B` hints out of a pointer → total span, or
+ * null when there is none. A multi-section pointer
+ * (`<doc> §S12 — lines 10,20; §S13 — lines 40,55`) sums its ranges: the task
+ * covers every listed section, so its size is all of them together.
+ */
+export function pointerLineSpan(pointer: string): number | null {
+  let total: number | null = null;
+  for (const m of pointer.matchAll(/lines?\s+(\d+)\s*[,\-–]\s*(\d+)/gi)) {
+    const a = Number(m[1]);
+    const b = Number(m[2]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    total = (total ?? 0) + Math.abs(b - a);
+  }
+  return total;
 }
 
 /** The matched substring for a nicer error/warning message. */

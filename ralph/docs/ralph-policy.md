@@ -147,7 +147,9 @@ trivially → the stage fails (check: `result=fail`; merge: `result=fail stage=m
 ### Reading: only your slice
 
 Read your task's section of the feature doc, found **by its heading** (line numbers are a hint),
-plus any issue it names (`gh issue view <n>`). Never read the whole roadmap. If the task and its
+plus any issue it names (`gh issue view <n>`). A task that batches several sections has a
+pointer listing each (`<doc> §S12 — lines A,B; §S13 — lines C,D`): read every one, and every
+section's acceptance applies. Never read the whole roadmap. If the task and its
 issue disagree, the issue wins: say so in the PR.
 
 ### Guardrails: stop, post `ralph:blocked`, return `blocked`
@@ -513,3 +515,6 @@ MERGE GATE you run goes through it, as the addendum shows.
   validator enforces it.
 - A code task may carry `size: "small" | "standard"` (absent = standard); the validator refuses
   `small` on any other kind.
+- A code task may carry `files` (the repo paths it edits) and `unbatched` (why it stays a separate
+  PR from a same-file neighbour); the validator uses them to refuse an unbatched small same-file
+  pair (authoring guide §Batch tiny neighbours).

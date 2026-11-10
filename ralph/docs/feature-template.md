@@ -13,6 +13,9 @@
       and a `Verify:` line — a concrete command, or `gate` (the typecheck + its
       red tests; code only), or `manual` (Matt reads + merges the PR; never for code);
     • a small, low-risk code task can add `Size: small` (no red, no check stage);
+    • tiny changes to the same files go under ONE heading (one task, one PR) —
+      Ralph refuses a small task chained behind a same-file neighbour unless the
+      ledger task says why (`unbatched`); name the files each code task edits;
     • deps stated in prose (they must form a DAG);
     • irreversible/prod steps (hosting/auth/payments settings, env flags, live-DB
       writes, deploys, any other-repo change) go in their OWN task, tagged
