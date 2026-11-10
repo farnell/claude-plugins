@@ -31,7 +31,10 @@
 //                  mega-task worth splitting),
 //                · soft prod-touching wording that should probably be gated,
 //                · a runnable small code task with no `files` (the batching
-//                  check can't compare it with its neighbours).
+//                  check can't compare it with its neighbours),
+//                · two runnable STANDARD code tasks with the same shape as the
+//                  hard error above (shared file, linked by deps): consider
+//                  batching them ("batch by default").
 //
 // Wired into the same two points as the dep validator: the /ralph skill
 // (derivation time) and the ralph-loop workflow preflight.
@@ -44,6 +47,7 @@ import { realRunCheck, validateExtraCheck, type RunCheck } from "./repo-check.ts
 import { checkTypes, contextFrom, extraChecks, NO_CONTEXT, validateDoneWhen, type GateContext } from "./gate-checks.ts";
 import { isEntryPoint } from "./is-entry-point.ts";
 import { SIZES } from "./next-step.ts";
+import { isClosed } from "./ledger-status.ts";
 
 // `verify` sentinels (see the loop / policy §5):
 //   "manual" — no machine check; the agent does the work, commits it, sets the
@@ -75,6 +79,7 @@ export interface AuthorabilityTaskLike {
   verify?: unknown;
   kind?: unknown;
   status?: unknown;
+  batched_into?: unknown;
   done_when?: unknown;
   blind_check?: unknown;
   size?: unknown;
@@ -217,7 +222,8 @@ export function validateLedgerAuthorability(
     // ---- kind (routes the task through the PR pipeline) ----
     // Required on every task the loop could still run; a done task (old
     // ledgers) or a human gate may omit it.
-    const runnable = !gated && obj.status !== "done";
+    // A batched row (folded into another task, ledger-status.ts) is closed like a done one.
+    const runnable = !gated && !isClosed(obj);
     const kind = obj.kind;
     if (kind === undefined || kind === null) {
       if (runnable) {
@@ -252,7 +258,7 @@ export function validateLedgerAuthorability(
     // this exists to remove. A non-gate is proven by its own PR, so a done_when
     // there is a mistake.
     const isGateTask = gated || obj.kind === "decision";
-    if (isGateTask && obj.status !== "done") {
+    if (isGateTask && !isClosed(obj)) {
       const ctx = opts.ctx ?? NO_CONTEXT;
       const shapeErrors = validateDoneWhen(obj.done_when, ctx);
       // Repo-provided checks: the repo's own command judges their shape.
@@ -271,7 +277,7 @@ export function validateLedgerAuthorability(
     // ---- evidence nobody creates (warn) ----
     // 2026-10-12: gates waited on doc-contains in a log file that did not exist
     // and that no task wrote, so Matt would have hand-written the evidence.
-    if (isGateTask && obj.status !== "done" && opts.fileExistsOnMain) {
+    if (isGateTask && !isClosed(obj) && opts.fileExistsOnMain) {
       for (const file of docContainsFiles(obj.done_when)) {
         if (!opts.fileExistsOnMain(file) && !taskText.includes(file)) {
           warnings.push(
@@ -366,14 +372,16 @@ export function validateLedgerAuthorability(
 
     // ---- mega-task heuristic (warn) ----
     const span = pointerLineSpan(pointer);
-    if (span !== null && span > MEGA_TASK_LINE_SPAN) {
+    if (runnable && span !== null && span > MEGA_TASK_LINE_SPAN) {
       warnings.push(
-        `${label} spans ~${span} lines (${pointer}) — likely more than one context-window of work; consider splitting it into smaller tasks.`,
+        `${label} spans ~${span} lines (${pointer}) — over the ~${MEGA_TASK_LINE_SPAN}-line cap for one task (a batch's sections are summed); split it, or batch fewer sections.`,
       );
     }
   });
 
-  errors.push(...batchingErrors(rawTasks as AuthorabilityTaskLike[]));
+  const batching = batchingFindings(rawTasks as AuthorabilityTaskLike[]);
+  errors.push(...batching.errors);
+  warnings.push(...batching.warnings);
 
   return { ok: errors.length === 0, errors, warnings };
 }
@@ -394,6 +402,12 @@ export function validateLedgerAuthorability(
 // through a human gate / decision is not counted: the gate has to happen
 // between them, so they can't be one PR. Escape hatch: either task carries a
 // non-empty `unbatched` reason.
+//
+// The same shape with two STANDARD tasks is a warning, not an error (1.2.0,
+// "batch by default"): reviews are LLM-run, so a 2–3 section PR is fine, but a
+// pair of standard tasks can have a real reason to stay apart (a migration the
+// addendum keeps on its own, a combined slice over the span cap) that the
+// ledger can't see.
 // ---------------------------------------------------------------------------
 
 function isStringArray(v: unknown): v is string[] {
@@ -414,8 +428,9 @@ function isGateLike(t: AuthorabilityTaskLike): boolean {
   return t.human_gate === true || t.kind === "decision";
 }
 
-function batchingErrors(tasks: AuthorabilityTaskLike[]): string[] {
+function batchingFindings(tasks: AuthorabilityTaskLike[]): { errors: string[]; warnings: string[] } {
   const errors: string[] = [];
+  const warnings: string[] = [];
   const byId = new Map<string, AuthorabilityTaskLike>();
   for (const t of tasks) {
     if (t && typeof t.id === "string" && t.id !== "" && !byId.has(t.id)) byId.set(t.id, t);
@@ -423,7 +438,7 @@ function batchingErrors(tasks: AuthorabilityTaskLike[]): string[] {
   const depsOf = (t: AuthorabilityTaskLike): string[] =>
     Array.isArray(t.deps) ? t.deps.filter((d): d is string => typeof d === "string") : [];
   const candidate = (t: AuthorabilityTaskLike | undefined): t is AuthorabilityTaskLike =>
-    !!t && t.kind === "code" && t.status !== "done" && !isGateLike(t);
+    !!t && t.kind === "code" && !isClosed(t) && !isGateLike(t);
 
   for (const later of byId.values()) {
     if (!candidate(later)) continue;
@@ -439,25 +454,36 @@ function batchingErrors(tasks: AuthorabilityTaskLike[]): string[] {
       seen.add(id);
       const earlier = byId.get(id);
       if (!earlier || isGateLike(earlier)) continue;
+      // A dep on a folded row is a dep on its host (ledger-status.ts).
+      if (earlier.status === "batched") {
+        if (typeof earlier.batched_into === "string") stack.push(earlier.batched_into);
+        continue;
+      }
       stack.push(...depsOf(earlier));
 
       if (!candidate(earlier)) continue;
-      if (later.size !== "small" && earlier.size !== "small") continue;
       const earlierFiles = new Set(filesOf(earlier));
       const shared = [...new Set(laterFiles)].filter((f) => earlierFiles.has(f));
       if (shared.length === 0) continue;
       if (hasUnbatchedReason(later) || hasUnbatchedReason(earlier)) continue;
+      const sharedList = shared.map((f) => `"${f}"`).join(", ");
+      if (later.size !== "small" && earlier.size !== "small") {
+        warnings.push(
+          `tasks "${earlier.id}" and "${later.id}" both edit ${sharedList} and "${later.id}" depends on "${earlier.id}" — consider batching them into one task (one PR; its pointer can list both sections), or add "unbatched": "<reason>" if they must be separate PRs (a migration the addendum keeps on its own, a combined slice over ~${MEGA_TASK_LINE_SPAN} lines).`,
+        );
+        continue;
+      }
 
       const emptyReason =
         later.unbatched !== undefined || earlier.unbatched !== undefined
           ? ' An empty "unbatched" is not a reason.'
           : "";
       errors.push(
-        `tasks "${earlier.id}" and "${later.id}" both edit ${shared.map((f) => `"${f}"`).join(", ")} and "${later.id}" depends on "${earlier.id}", with at least one of them size:"small" — merge them into one task (one PR; its pointer can list both sections), or add "unbatched": "<reason>" to say why they must be separate PRs.${emptyReason}`,
+        `tasks "${earlier.id}" and "${later.id}" both edit ${sharedList} and "${later.id}" depends on "${earlier.id}", with at least one of them size:"small" — merge them into one task (one PR; its pointer can list both sections), or add "unbatched": "<reason>" to say why they must be separate PRs.${emptyReason}`,
       );
     }
   }
-  return errors;
+  return { errors, warnings };
 }
 
 // A slice bigger than this many lines probably bundles more than one unit of

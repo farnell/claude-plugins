@@ -15,6 +15,7 @@ interface RenderTask {
   deps?: string[];
   human_gate?: boolean;
   kind?: string;
+  batched_into?: string;
 }
 
 interface RenderLedger {
@@ -35,11 +36,13 @@ export function renderLedgerMd(ledger: RenderLedger, jsonPath: string): string {
     "",
   ];
   for (const t of ledger.tasks) {
-    const box = t.status === "done" ? "[x]" : "[ ]";
+    const box = t.status === "done" || t.status === "batched" ? "[x]" : "[ ]";
     const deps = t.deps && t.deps.length ? ` (after ${t.deps.join(", ")})` : "";
     // Only non-code kinds are worth a tag: code is the default shape.
-    const kind = t.status !== "done" && !t.human_gate && t.kind && t.kind !== "code" ? ` · ${t.kind}` : "";
-    const tail = t.human_gate
+    const kind = t.status !== "done" && t.status !== "batched" && !t.human_gate && t.kind && t.kind !== "code" ? ` · ${t.kind}` : "";
+    const tail = t.status === "batched"
+      ? ` — ↪ batched into ${t.batched_into ?? "?"}`
+      : t.human_gate
       ? " — 🔒 human-gate"
       : t.status === "blocked"
         ? " — ⛔ blocked"

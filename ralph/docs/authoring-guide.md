@@ -54,28 +54,56 @@ caught real bugs.
 
 The validator refuses `size: "small"` on any kind but `code`.
 
-### Batch tiny neighbours (enforced)
+### Batch by default
 
-Every task costs ~3–5 fresh agents, each starting with ~40k tokens of fixed context. A small task
-that edits the same file as a task it waits on is that cost twice for one change, so the validator
-**refuses** it. Every runnable code task in the ledger lists the repo-relative paths it expects to
-edit in **`files`** (best effort, from its section), and:
+Every task costs ~3–5 fresh agents, each starting with ~40k tokens of fixed context, and reviews
+are LLM-run, so a PR covering 2–3 related sections is fine. **A doc section is a unit of spec; a
+ledger task is a unit of PR.** At derivation, group related `code` sections into one task covering
+**up to ~3 sections**: the same feature area or panel, the same `files`, or a direct dep chain
+(e.g. a data loader + the help page that shows it; a panel rebuild + its chart; three cleanup /
+copy edits in one component). Every runnable code task lists the repo-relative paths it expects to
+edit in **`files`** (best effort, from its sections).
 
-> Two runnable (not done, not gated) `code` tasks, at least one `size: "small"`, that share a path
-> in `files`, where one depends on the other through `deps` (directly or through other tasks) →
-> **error**. A dep path that runs through a human gate or decision doesn't count: the gate has to
-> happen between them.
+**The batch shape.** Title `X and Y (S12 + S13)`; pointer `<doc> §S12 — lines A,B; §S13 — lines C,D`.
+The stages read every listed section, and every section's acceptance applies. `files` is the union;
+`deps` is the union minus the members; the batch is `size: "small"` only if every member would be
+small, else standard. A dep that only existed to serialize two members on a shared file goes away.
 
-Fix it by merging them into **one task** (one PR). A task may cover several doc sections: title
-`X and Y (S12 + S13)`, pointer `<doc> §S12 — lines A,B; §S13 — lines C,D`; the stages read every
-listed section, and every section's acceptance applies. Drop the dep that only existed to
-serialize the two. If they really must be separate PRs (the first ships behind a step that has to
-happen before the second, a review needs the first on its own), add
-`"unbatched": "<reason>"` to either task; an empty reason still errors. A runnable small code task
-with no `files` can't be checked, so it gets a warning.
+**Keep a task on its own when:**
+- it carries a migration (or the repo's addendum says never-batch);
+- it is a human gate or decision, or the chain between the members crosses one (the gate has to
+  happen between them);
+- the kinds differ (a `docs` or `measure` section doesn't join a `code` task);
+- the combined slice is over ~150 lines (the summed pointer ranges; the span warning says so);
+- there is a stated reason: `"unbatched": "<reason>"` on the task.
+
+**What the validator enforces** (both apply to runnable, not-done, not-gated `code` tasks that
+share a path in `files` where one depends on the other through `deps`, directly or through other
+tasks but never through a gate):
+- at least one of the pair `size: "small"` → **error**: merge them;
+- both standard → **warning**: consider batching them.
+
+Either is silenced by a non-empty `"unbatched": "<reason>"` on either task (an empty string still
+errors). A runnable small code task with no `files` can't be checked, so it warns.
 
 In the feature doc, put tiny same-file changes under one heading (or say `Batch with S12`) so the
 derivation needn't guess.
+
+### Folding a task into another mid-run (`status: "batched"`)
+
+To batch tasks after the ledger is live (even while a run is going), **fold** them; never delete
+a row. On the folded task set `"status": "batched"` and `"batched_into": "<host id>"`, and keep the
+row. On the host: extend the title and pointer to list the folded sections, union in the folded
+task's `files`, and add any of its `deps` the host doesn't already wait on (the deps validator
+errors if the host misses one, or still depends on a task folded into it). A dep elsewhere on the
+folded task now means its host; you may leave it or repoint it. Re-render and land the ledger PR.
+
+A batched row is closed: the loop never runs or parks it, `render-ledger` shows it as
+`↪ batched into <host>`, and the planner counts it apart from the open tasks, so the run carries
+on. (2026-11-10: a fold that deleted two rows stopped a run with "open tasks dropped from 13 to 11
+with 0 merge(s)".) Rules: fold only a task with no open PR (close it first), fold into a host that
+is not a gate and not itself batched, and never fold a gate.
+
 ### Blind checks in a `measure` task: `Blind check: yes`
 
 If a measure task grades a sample and its method calls for a **blind** or **independent** check
@@ -146,9 +174,10 @@ with the same `repo`). Ralph never edits another repo.
    **checkbox list** with one `###` section per box whose heading *matches the box text* (so the
    pointer locates the slice by heading). A pure-narrative doc makes the skill **stop and ask** —
    it won't fabricate tasks.
-2. **Size each task to one context window / "one sentence without *and*."** Good: "add a column +
-   migration", "add one route handler + its Zod schema", "add tests for module X". Combining
-   features in one task is the most common authoring mistake (and trips the mega-task warning).
+2. **Size each section to "one sentence without *and*."** Good: "add a column + migration", "add
+   one route handler + its Zod schema", "add tests for module X". Write sections small and let the
+   derivation batch related ones into a PR (§Batch by default); a section that bundles unrelated
+   features is still the most common authoring mistake (and trips the span warning).
 3. **Behavioral, testable acceptance criteria — never "works correctly."** State the observable
    outcome: *"`POST /api/foo` with a valid body returns 200 `{ok:true}`; 400 on a bad body; 401
    with no session."*
@@ -269,12 +298,17 @@ preflight. Two tiers:
 - a malformed `files` (not an array of strings) or a non-string `unbatched`;
 - an **unbatched same-file pair**: two runnable `code` tasks, at least one `small`, sharing a path
   in `files`, one depending on the other (directly or transitively, not through a gate), and
-  neither carrying a non-empty `unbatched` reason — merge them (§Batch tiny neighbours).
+  neither carrying a non-empty `unbatched` reason — merge them (§Batch by default);
+- a malformed fold (deps validator): a `batched` row with no / unknown / self / batched / gate
+  `batched_into`, `batched_into` on a row that isn't batched, a batched gate, a host that still
+  depends on a task folded into it, or a host that doesn't wait on a folded task's deps.
 
 **Warnings (advisory, never block):**
-- a task whose pointer slice spans many lines (likely an and-joined mega-task — split it); a
-  multi-section pointer counts the sum of its ranges;
+- a runnable task whose pointer slice spans over ~150 lines — a multi-section pointer counts the
+  sum of its ranges, so a sensible 2–3 section batch doesn't warn; split it or batch fewer;
 - a runnable `small` code task with no `files` (the batching check can't see it);
+- two runnable **standard** code tasks sharing a path in `files`, one depending on the other (not
+  through a gate), with no `unbatched` reason — consider batching them;
 - softer prod-touching wording ("deploy", "production", "flip flag", …) in a non-gated task —
   confirm it only *writes* code; if it applies/deploys, gate it;
 - a gate's `doc-contains` check on a file that is not on `origin/main` and that no task in the

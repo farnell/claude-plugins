@@ -210,6 +210,16 @@ describe("planGateTicks — which gates Ralph ticks itself", () => {
     expect(String(hg1.notes)).toMatch(/auto-ticked/);
   });
 
+  it("a gate's dep on a batched (folded) task is met once the host is done", async () => {
+    const l = ledger();
+    l.tasks[0]!.status = "batched";
+    l.tasks[0]!.batched_into = "W0";
+    l.tasks.unshift({ id: "W0", title: "host", status: "todo" });
+    expect((await planGateTicks(l, io(), "2026-10-10", CTX)).ticked).toEqual([]);
+    l.tasks[0]!.status = "done";
+    expect((await planGateTicks(l, io(), "2026-10-10", CTX)).ticked.map((t) => t.id)).toEqual(["HG-1", "HG-2"]);
+  });
+
   it("never ticks a gate whose deps are not done, even if its evidence exists", async () => {
     const l = ledger();
     l.tasks[0]!.status = "todo"; // W1 not done

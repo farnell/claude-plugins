@@ -205,3 +205,58 @@ describe("runCli (exit codes + file IO)", () => {
     expect(runCli(["node", "script", p])).toBe(1);
   });
 });
+
+describe("validateLedgerDeps — folds (status batched)", () => {
+  const fold = (id: string, into: unknown, deps: string[] = []) => ({ id, deps, status: "batched", batched_into: into });
+
+  it("accepts a well-formed fold, and reads a dep on the folded row as a dep on its host", () => {
+    const res = validateLedgerDeps({ tasks: [task("H"), fold("F", "H"), task("D", ["F"])] });
+    expect(res).toEqual({ ok: true, errors: [] });
+  });
+
+  it("rejects a fold with no, unknown, self, batched or gate host", () => {
+    const res = validateLedgerDeps({
+      tasks: [
+        task("H"),
+        { id: "G", deps: [], status: "todo", human_gate: true },
+        fold("F1", undefined),
+        fold("F2", "NOPE"),
+        fold("F3", "F3"),
+        fold("F4", "F1"),
+        fold("F5", "G"),
+      ],
+    });
+    expect(res.ok).toBe(false);
+    expect(res.errors.join("\n")).toMatch(/"F1" has status:"batched" but no "batched_into"/);
+    expect(res.errors.join("\n")).toMatch(/"F2" is batched into unknown task id "NOPE"/);
+    expect(res.errors.join("\n")).toMatch(/"F3" is batched into itself/);
+    expect(res.errors.join("\n")).toMatch(/"F4" is batched into "F1", which is itself batched/);
+    expect(res.errors.join("\n")).toMatch(/"F5" is batched into "G", a human gate/);
+  });
+
+  it("rejects batched_into on a row that is not batched, and a batched gate", () => {
+    const res = validateLedgerDeps({
+      tasks: [task("H"), { id: "X", deps: [], status: "todo", batched_into: "H" }, { ...fold("G", "H"), human_gate: true }],
+    });
+    expect(res.errors.join("\n")).toMatch(/"X" has "batched_into" but its status is not "batched"/);
+    expect(res.errors.join("\n")).toMatch(/"G" is a human gate \/ decision with status:"batched"/);
+  });
+
+  it("rejects a host that still depends on a task folded into it", () => {
+    const res = validateLedgerDeps({ tasks: [fold("F", "H"), task("H", ["F"])] });
+    expect(res.errors).toEqual([expect.stringMatching(/"H" depends on "F", which is batched into "H" — drop the dep/)]);
+  });
+
+  it("rejects a host that doesn't carry its folded task's dep; accepts one that reaches it transitively", () => {
+    const bad = validateLedgerDeps({ tasks: [task("P"), task("H"), fold("F", "H", ["P"])] });
+    expect(bad.errors).toEqual([expect.stringMatching(/"F" is batched into "H" but "H" doesn't depend on "P"/)]);
+    const ok = validateLedgerDeps({ tasks: [task("P"), task("Q", ["P"]), task("H", ["Q"]), fold("F", "H", ["P"])] });
+    expect(ok.ok).toBe(true);
+  });
+
+  it("finds a cycle that only exists through a fold", () => {
+    // H depends on D, D depends on F, F is folded into H → H -> D -> H.
+    const res = validateLedgerDeps({ tasks: [task("H", ["D"]), task("D", ["F"]), fold("F", "H")] });
+    expect(res.errors.join("\n")).toMatch(/dependency cycle detected/);
+  });
+});

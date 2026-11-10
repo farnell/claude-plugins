@@ -42,6 +42,7 @@ import { execFileSync } from "node:child_process";
 import { loadAdapter } from "./adapter.ts";
 import { contextFrom, NO_CONTEXT, validateDoneWhen, type GateContext } from "./gate-checks.ts";
 import { isEntryPoint } from "./is-entry-point.ts";
+import { isClosed, resolveHost } from "./ledger-status.ts";
 
 // The Nth failure parks the task: 3 → two fix rounds get acted on.
 export const MAX_CHECK_FAILURES = 3;
@@ -64,6 +65,8 @@ export interface LedgerTask {
   blind_check?: boolean;
   /** code only: "small" skips the red and check stages (see SIZES). Absent = "standard". */
   size?: string;
+  /** status "batched" only: the task whose PR ships this one's section. */
+  batched_into?: string;
 }
 
 /** Pipeline size of a code task. "small" = implement -> review -> merge. */
@@ -239,7 +242,7 @@ function stageAfter(last: Marker | undefined, full: boolean, manual: boolean, bl
 
 /** The pure per-task decision. `done` = ids whose ledger status is done on main. */
 export function resolveTask(task: LedgerTask, pr: PrFacts | undefined, done: Set<string>, ctx: GateContext = NO_CONTEXT): Resolution {
-  if (task.status === "done") return { action: "skip" };
+  if (isClosed(task)) return { action: "skip" };
   // A gate is Matt's step. tick-gates.ts ticks it from its `done_when` evidence at
   // the start of every run; one with no valid check can never be ticked, so it is
   // reported apart ("gate-no-check": Ralph adds the check on the next ledger refresh).
@@ -308,7 +311,10 @@ export interface NextStepResult {
   hasNext: boolean;
   next: NextTask;
   parked: { id: string; reason: string }[];
+  /** Open tasks: not done and not batched. */
   remaining: number;
+  /** Rows folded into another task (status "batched"). A fold moves a task from `remaining` to here, so the loop can tell it from a vanished task. */
+  batched: number;
 }
 
 const EMPTY_NEXT: NextTask = {
@@ -328,8 +334,12 @@ export function nextStep(ledger: LedgerLike, prs: PrFacts[], skip: Set<string>, 
   const parked: { id: string; reason: string }[] = [];
   let next: NextTask | null = null;
 
-  for (const task of ledger.tasks) {
-    if (task.status === "done") continue;
+  for (const raw of ledger.tasks) {
+    if (isClosed(raw)) continue;
+    // A dep on a batched task waits on its host; a dep on a task folded into
+    // this one is this task's own work, so it drops out.
+    const deps = (raw.deps ?? []).map((d) => resolveHost(d, ledger.tasks)).filter((d) => d !== raw.id);
+    const task = { ...raw, deps };
     const branch = branchFor(ledger.feature.slug, task.id);
     const pr = prForBranch(prs, branch);
     const r = skip.has(task.id) ? ({ action: "park", reason: "skipped-this-run" } as const) : resolveTask(task, pr, done, ctx);
@@ -363,7 +373,8 @@ export function nextStep(ledger: LedgerLike, prs: PrFacts[], skip: Set<string>, 
     hasNext: next !== null,
     next: next ?? EMPTY_NEXT,
     parked,
-    remaining: ledger.tasks.filter((t) => t.status !== "done").length,
+    remaining: ledger.tasks.filter((t) => !isClosed(t)).length,
+    batched: ledger.tasks.filter((t) => t.status === "batched").length,
   };
 }
 
@@ -403,7 +414,7 @@ export function loadAndDecide(
   // long-lived feature's older PRs could fall out of.
   const prs: PrFacts[] = [];
   for (const task of ledger.tasks) {
-    if (task.status === "done") continue;
+    if (isClosed(task)) continue;
     const branch = branchFor(ledger.feature.slug, task.id);
     const raw = JSON.parse(
       exec("gh", ["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,headRefName,headRefOid,url,comments"]),

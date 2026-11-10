@@ -13,10 +13,15 @@
 
 import { readFileSync } from "node:fs";
 import { isEntryPoint } from "./is-entry-point.ts";
+import { BATCHED } from "./ledger-status.ts";
 
 export interface LedgerTaskLike {
   id?: unknown;
   deps?: unknown;
+  status?: unknown;
+  batched_into?: unknown;
+  human_gate?: unknown;
+  kind?: unknown;
 }
 
 export interface LedgerLike {
@@ -33,7 +38,16 @@ export interface ValidationResult {
  *   (a) duplicate task ids,
  *   (b) a `deps` entry referencing a non-existent task id,
  *   (c) a task depending on itself,
- *   (d) any dependency cycle (reported as a path, e.g. `T1 -> T2 -> T1`).
+ *   (d) any dependency cycle (reported as a path, e.g. `T1 -> T2 -> T1`),
+ *   (e) a malformed fold: a `status:"batched"` row whose `batched_into` is
+ *       missing, itself, unknown, another batched row or a gate; a
+ *       `batched_into` on a row that is not batched; a gate that is batched; a
+ *       host that depends on a task folded into it; or a host that doesn't
+ *       carry (directly or transitively) a dep of a task folded into it.
+ *
+ * A dep on a batched row is read as a dep on its host (ledger-status.ts), and a
+ * batched row's own deps are the host's job, so the cycle pass runs on the
+ * remapped graph.
  *
  * Pure and side-effect-free; errors are human-readable strings. Edges are
  * read as "task -> dep" (the task depends on dep), so a reported cycle path
@@ -74,7 +88,7 @@ export function validateLedgerDeps(ledger: LedgerLike): ValidationResult {
         });
       }
     }
-    return { index, id, deps };
+    return { index, id, deps, raw: obj };
   });
 
   // (a) duplicate ids — and collect the set of declared ids.
@@ -93,10 +107,45 @@ export function validateLedgerDeps(ledger: LedgerLike): ValidationResult {
   }
 
   const idSet = new Set(idCounts.keys());
+  const byId = new Map<string, (typeof tasks)[number]>();
+  for (const t of tasks) if (t.id !== "" && !byId.has(t.id)) byId.set(t.id, t);
+  const gateLike = (o: LedgerTaskLike) => o.human_gate === true || o.kind === "decision";
+
+  // (e) fold shape. `hostOf` maps each well-formed batched row to its host.
+  const hostOf = new Map<string, string>();
+  for (const t of tasks) {
+    const label = t.id !== "" ? `task "${t.id}"` : `task at index ${t.index}`;
+    const batched = t.raw.status === BATCHED;
+    const into = t.raw.batched_into;
+    if (!batched) {
+      if (into !== undefined && into !== null) {
+        errors.push(`${label} has "batched_into" but its status is not "batched" — set status:"batched" to fold it, or drop "batched_into".`);
+      }
+      continue;
+    }
+    if (gateLike(t.raw)) {
+      errors.push(`${label} is a human gate / decision with status:"batched" — a gate is Matt's step and can't be folded into a PR.`);
+      continue;
+    }
+    if (typeof into !== "string" || into.trim() === "") {
+      errors.push(`${label} has status:"batched" but no "batched_into" — name the task whose PR ships its section.`);
+    } else if (into === t.id) {
+      errors.push(`${label} is batched into itself.`);
+    } else if (!byId.has(into)) {
+      errors.push(`${label} is batched into unknown task id "${into}".`);
+    } else if (byId.get(into)!.raw.status === BATCHED) {
+      errors.push(`${label} is batched into "${into}", which is itself batched — point it at the final host.`);
+    } else if (gateLike(byId.get(into)!.raw)) {
+      errors.push(`${label} is batched into "${into}", a human gate / decision — fold it into a code/docs/measure task.`);
+    } else if (t.id !== "") {
+      hostOf.set(t.id, into);
+    }
+  }
 
   // (b) unknown dep ids + (c) self-deps. Build the adjacency for the cycle pass
   // from valid, non-self edges only (a dangling/self edge can't form a cycle and
-  // is already reported here, so excluding it avoids double-reporting).
+  // is already reported here, so excluding it avoids double-reporting). A dep
+  // on a folded row becomes an edge to its host; a folded row adds no edges.
   const adjacency = new Map<string, string[]>();
   for (const id of idSet) adjacency.set(id, []);
 
@@ -111,8 +160,38 @@ export function validateLedgerDeps(ledger: LedgerLike): ValidationResult {
         errors.push(`task "${t.id}" depends on unknown task id "${dep}"`);
         continue;
       }
+      if (hostOf.has(t.id)) continue;
+      const target = hostOf.get(dep) ?? dep;
+      if (target === t.id) {
+        errors.push(`task "${t.id}" depends on "${dep}", which is batched into "${t.id}" — drop the dep (its section is part of "${t.id}" now).`);
+        continue;
+      }
       const edges = adjacency.get(t.id);
-      if (edges && !edges.includes(dep)) edges.push(dep);
+      if (edges && !edges.includes(target)) edges.push(target);
+    }
+  }
+
+  // (e) a host must wait on everything its folded tasks waited on.
+  const reaches = (from: string, to: string): boolean => {
+    const seen = new Set<string>();
+    const stack = [...(adjacency.get(from) ?? [])];
+    while (stack.length) {
+      const n = stack.pop()!;
+      if (n === to) return true;
+      if (seen.has(n)) continue;
+      seen.add(n);
+      stack.push(...(adjacency.get(n) ?? []));
+    }
+    return false;
+  };
+  for (const [folded, host] of hostOf) {
+    for (const dep of byId.get(folded)!.deps) {
+      if (!idSet.has(dep)) continue;
+      const target = hostOf.get(dep) ?? dep;
+      if (target === host || target === folded) continue;
+      if (!reaches(host, target)) {
+        errors.push(`task "${folded}" is batched into "${host}" but "${host}" doesn't depend on "${target}" (a dep of "${folded}") — add it to "${host}"'s deps so the batch still waits for it.`);
+      }
     }
   }
 
