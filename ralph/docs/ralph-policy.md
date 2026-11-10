@@ -12,10 +12,10 @@ One policy for every roadmap Ralph grinds. Each task becomes **one PR** that mov
 fresh-context stages, each a separate agent in its own worktree:
 
 ```
-code:            red → implement → check → review → merge
-code, small:           implement → review → merge                   (size:"small", since 2026-11-02)
-docs / measure:        implement → [blind-check] → review → merge   (verify:"manual" → parks for Matt)
-decision / gate: never run — Matt does it; ticked from its done_when evidence (below)
+code, lane full:   red → implement → check → review → merge
+code, lane light:        implement → review → merge                   (= size:"small", since 2026-11-02)
+docs / measure:          implement → [blind-check] → review → merge   (verify:"manual" → parks for Matt)
+lane human (gate): never run — Matt does it; ticked from its done_when evidence (below)
 ```
 
 **docs/measure have no separate check stage** (since 2026-10-12): their review does the check
@@ -23,7 +23,7 @@ duties itself (§review). On the first real run the check stage only re-confirme
 re-checked, at a full agent's cost. **`blind-check`** runs only for a `measure` task whose ledger
 entry says `blind_check: true` (§blind-check).
 
-**The merge stage is a script first** (since 2026-11-02): a helper agent relays RALPH `merge`,
+**The merge stage is a script first** (since 2026-11-02): a Haiku relay agent runs RALPH `merge`,
 which runs the repo's merge guard (if it has one), catches the branch up (resolving the routine
 ledger-only conflict itself), runs the MERGE GATE (through the repo's gate wrapper, if it has one,
 e.g. a machine-wide lock), waits for the PR's CI if the repo gates on it, and squash-merges when
@@ -32,7 +32,7 @@ reaches the Sonnet merge agent (§merge), and that agent is told what the script
 `busy` gate wrapper (another heavy job on this machine) skips the task for the run instead of
 failing it.
 
-**Small code tasks** (`size: "small"` in the ledger) have no red and no check stage: implement
+**Light code tasks** (`lane: "light"`, or the older `size: "small"`) have no red and no check stage: implement
 writes the tests with the code, and review does the check duties (§review). A fresh stage agent
 starts with ~40k tokens of fixed context, so these two stages were most of a small task's cost.
 
@@ -306,13 +306,14 @@ Reuse the existing branch and PR; open nothing new.
 4. Run TYPECHECK (skip for a docs-only diff), the task's tests (red's and your own), and its `verify`
    command. All must pass before you push.
 
-   **Small code tasks** (`size: "small"`, no red stage): with no PR yet, detach at `origin/main` and
+   **Light code tasks** (`lane: "light"` / `size: "small"`, no red stage): with no PR yet, detach at `origin/main` and
    open the draft PR at the end as in red step 4. You write the acceptance tests yourself, to red
    step 2's rules (expected values from outside the code, through an entry point, no mocked
    internals), in the same PR, and list them with the **Seams** in the PR body. If the work turns
-   out not to be small (a migration, core decision logic, far more than ~300 lines), stop and post
-   the blocked comment (`--reason too-big`, "this task is bigger than a small task; change its
-   size to standard in the ledger and reply retry"). Don't carry on unreviewed.
+   out to belong in the full lane (a migration, money / auth / data-write / time-zone logic, core
+   decision logic, security), stop and post the blocked comment (`--reason too-big`, "this task
+   needs the full lane; set its lane to full in the ledger and reply retry"). Size alone is not a
+   reason: a light task may batch several sections. Don't carry on unreviewed.
 5. **Tick the ledger in this PR:** set the task's `status:"done"`, bump `attempts`, set
    `updatedAt`, one-line `notes` (PR number). Change no other task. Then re-render the `.md`:
    RALPH `render-ledger <ledger.json>`. The tick lands on main when the PR
@@ -387,11 +388,12 @@ reviewing, run check steps 1–5 yourself (pushed head equals the `sha=` on the 
 `manual`, confirm the PR records what the slice says — and confirm exactly this task's ledger
 tick). Any failure there is a blocking finding (`verdict=changes`).
 
-**Small code tasks: do the check duties first, too.** No red and no check stage ran, so run
+**Light code tasks: do the check duties first, too.** No red and no check stage ran, so run
 check steps 1–5 yourself (step 4 = TYPECHECK + the PR's tests + `verify`; there is no red guard).
 Then review the implementer's tests as strictly as you would red's (red step 2): they are the
-task's only acceptance tests. Also confirm the task still fits small (the policy header); if it
-doesn't, that is blocking: say the ledger task needs `size: "standard"`. A small task's review
+task's only acceptance tests. Also confirm the task still fits the light lane (no migration, no
+money / auth / data-write / time-zone / core decision logic, nothing security-sensitive); if it
+doesn't, that is blocking: say the ledger task needs `lane: "full"`. A light task's review
 never returns `redo-red` (there is no red stage); a bad test is an ordinary `changes` finding.
 
 **A measure task's blind check must not be self-done.** If the slice asks for a blind or
@@ -516,8 +518,9 @@ MERGE GATE you run goes through it, as the addendum shows.
   ledgers and park the task.
 - Every runnable task carries a `kind` (`code | docs | measure | decision`). The authorability
   validator enforces it.
-- A code task may carry `size: "small" | "standard"` (absent = standard); the validator refuses
-  `small` on any other kind.
+- A code task carries a `lane`: `full` (standard route) or `light` (= `size: "small"`); gates are
+  lane `human`. The lane sets the size; older ledgers may carry `size: "small" | "standard"`
+  instead (absent = standard). The validator refuses `small` on any kind but code.
 - A code task may carry `files` (the repo paths it edits) and `unbatched` (why it stays a separate
   PR from a same-file neighbour); the validator uses them to refuse an unbatched small same-file
   pair (authoring guide §Batch by default).

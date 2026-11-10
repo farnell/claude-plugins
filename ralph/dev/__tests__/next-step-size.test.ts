@@ -1,7 +1,7 @@
 // size:"small" code tasks run implement → review → merge (2026-11-02): no red
 // stage, no check stage. Everything else keeps its route.
 import { describe, it, expect } from "vitest";
-import { resolveTask, nextStep, isSmallCode, type LedgerTask, type PrFacts, type Marker } from "../../lib/next-step.ts";
+import { resolveTask, nextStep, isSmallCode, effectiveSize, type LedgerTask, type PrFacts, type Marker } from "../../lib/next-step.ts";
 
 function task(over: Partial<LedgerTask> = {}): LedgerTask {
   return { id: "T1", title: "t", pointer: "docs/x.md ### T1", status: "todo", deps: [], human_gate: false, kind: "code", verify: "gate", ...over };
@@ -57,5 +57,22 @@ describe("size: small code tasks", () => {
   it("the planner reports the size, defaulting to standard", () => {
     expect(nextStep({ feature: { slug: "feat" }, tasks: [small({ id: "A" })] }, [], new Set()).next.size).toBe("small");
     expect(nextStep({ feature: { slug: "feat" }, tasks: [task({ id: "B" })] }, [], new Set()).next.size).toBe("standard");
+  });
+});
+
+describe("lanes (1.3.0) map onto size", () => {
+  it("light runs the small route, full the standard route, whatever size says", () => {
+    expect(run(task({ lane: "light" }))).toMatchObject({ action: "run", stage: "implement" });
+    expect(run(task({ lane: "full" }))).toMatchObject({ action: "run", stage: "red" });
+  });
+  it("effectiveSize: lane wins, then size, then standard", () => {
+    expect(effectiveSize({ lane: "light" })).toBe("small");
+    expect(effectiveSize({ lane: "full", size: "small" })).toBe("standard");
+    expect(effectiveSize({ size: "small" })).toBe("small");
+    expect(effectiveSize({})).toBe("standard");
+  });
+  it("nextStep reports the lane's size to the stage", () => {
+    expect(nextStep({ feature: { slug: "feat" }, tasks: [task({ id: "A", lane: "light" })] }, [], new Set()).next.size).toBe("small");
+    expect(nextStep({ feature: { slug: "feat" }, tasks: [task({ id: "A", lane: "full" })] }, [], new Set()).next.size).toBe("standard");
   });
 });

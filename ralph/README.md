@@ -4,11 +4,15 @@ Ralph grinds a feature/roadmap markdown file into **merged PRs, one per task**. 
 through stages, and each stage is a **fresh agent in its own worktree**:
 
 ```
-code:            red → implement → check → review → merge
-code, small:           implement → review → merge                   (size:"small")
-docs / measure:        implement → [blind-check] → review → merge   (verify:"manual" parks for you)
-decision / gate: you do it; Ralph ticks it from its done_when evidence (lib/tick-gates.ts)
+code, lane full:  red → implement → check → review → merge
+code, lane light:       implement → review → merge                   (= size:"small")
+docs / measure:         implement → [blind-check] → review → merge   (verify:"manual" parks for you)
+lane human (gate): you do it; Ralph ticks it from its done_when evidence (lib/tick-gates.ts)
 ```
+
+Ralph triages every task into a lane itself when it derives the ledger: `full` for money, auth,
+data writes, migrations, time zones and security; `light` for UI, copy, wiring and removals; and
+it sweeps light work into as few PRs as the gates allow. A tiny doc becomes one PR.
 
 - **red** (Opus) writes the acceptance as real failing tests and opens a draft PR.
 - **implement** (Opus, or the task's `Model:`) makes them pass and ticks the ledger *in the PR*.
@@ -46,7 +50,7 @@ known-flakes list, as one PR.
 ```
 
 **Resume = run it again, from any session.** The loop holds no state that matters: each step a
-planner agent runs `lib/next-step.ts`, which reads the ledger JSON **on `origin/main`** and the
+Haiku relay agent (Sonnet on a recheck) runs `lib/next-step.ts`, which reads the ledger JSON **on `origin/main`** and the
 **marker comments** on each task's PR (`ralph:red`, `ralph:implemented sha=…`, `ralph:check
 result=…`, `ralph:review verdict=…`, `ralph:blocked`, `ralph:retry`). A stage's last act is
 posting its marker, so progress is durable the moment it happens.

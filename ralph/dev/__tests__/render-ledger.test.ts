@@ -58,3 +58,24 @@ describe("renderLedgerMd — batched rows", () => {
     expect(md).toContain("- [x] **B** Folded — ↪ batched into A\n");
   });
 });
+
+describe("renderLedgerMd — lanes", () => {
+  it("tags an open code task with its lane, and nothing else", () => {
+    const md = renderLedgerMd(
+      {
+        feature: { slug: "f" },
+        tasks: [
+          { id: "A", title: "UI", status: "todo", kind: "code", lane: "light" },
+          { id: "B", title: "Credits", status: "todo", kind: "code", lane: "full" },
+          { id: "C", title: "Old", status: "done", kind: "code", lane: "light" },
+          { id: "G", title: "Ship", status: "todo", human_gate: true, lane: "human" },
+        ],
+      },
+      "x.json",
+    );
+    expect(md).toContain("- [ ] **A** UI · light\n");
+    expect(md).toContain("- [ ] **B** Credits · full\n");
+    expect(md).toContain("- [x] **C** Old\n");
+    expect(md).toContain("- [ ] **G** Ship — 🔒 human-gate\n");
+  });
+});

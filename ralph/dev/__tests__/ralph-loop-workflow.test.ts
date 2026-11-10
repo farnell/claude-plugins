@@ -54,6 +54,10 @@ interface RunOpts {
   adapter?: Record<string, unknown>;
   /** The whole preflight answer, instead of a healthy one. */
   preflight?: Record<string, unknown> | null;
+  /** The preflight recheck's answer (default: the same as the first). */
+  preflightRecheck?: Record<string, unknown> | null;
+  /** The gates relay's answers, first then recheck (default: healthy). */
+  gates?: (Record<string, unknown> | null)[];
   args?: Record<string, unknown>;
 }
 
@@ -68,8 +72,12 @@ async function runWorkflow(plans: PlanScript[], o: RunOpts = {}) {
   const agent = async (prompt: string, opts: Opts = {}) => {
     calls.push({ prompt, opts });
     const label = opts.label ?? "";
-    if (label === "ralph:preflight") return o.preflight !== undefined ? o.preflight : { ok: true, error: "", warnings: "", adapter };
-    if (label === "ralph:gates") return { ok: true, error: "", ticked: [], waiting: [], noCheck: [], prUrl: "" };
+    const healthyPf = { ok: true, error: "", warnings: "", adapter };
+    if (label === "ralph:preflight") return o.preflight !== undefined ? o.preflight : healthyPf;
+    if (label === "ralph:preflight:recheck") return o.preflightRecheck !== undefined ? o.preflightRecheck : o.preflight !== undefined ? o.preflight : healthyPf;
+    const healthyGates = { ok: true, error: "", ticked: [], waiting: [], noCheck: [], prUrl: "" };
+    if (label === "ralph:gates") return o.gates && o.gates[0] !== undefined ? o.gates[0] : healthyGates;
+    if (label === "ralph:gates:recheck") return o.gates && o.gates[1] !== undefined ? o.gates[1] : healthyGates;
     if (label.startsWith("ralph:plan:")) {
       const p = plans[planIdx++];
       const cleanup = /worktrees\.ts" remove/.test(prompt) ? cleanupLine : "";
@@ -362,11 +370,44 @@ describe("ralph-loop workflow plumbing (2026-10-12 lessons)", () => {
       expect(calls.find((c) => c.opts.label === "ralph:plan:2:recheck")!.prompt).not.toMatch(/worktrees\.ts" remove/);
     });
 
-    it("the planner and every helper agent run on Sonnet, not Haiku", async () => {
+    it("the relay agents run on Haiku (1.3.0: the cheapest model; no runtime shell hook exists)", async () => {
       const { calls } = await runWorkflow([{ stage: "red" }, { stage: "implement" }, { stage: "check" }], { stageExtra: { outcome: "failed" } });
       const helpers = calls.filter((c) => c.opts.isolation !== "worktree");
       expect(new Set(helpers.map((c) => (c.opts.label ?? "").replace(/:\d+.*$/, "")))).toEqual(new Set(["ralph:preflight", "ralph:gates", "ralph:plan", "ralph:cleanup"]));
-      for (const c of helpers) expect(c.opts.model, c.opts.label).toBe("sonnet");
+      for (const c of helpers) expect(c.opts.model, c.opts.label).toBe("haiku");
+      for (const c of helpers) expect(c.opts.effort, c.opts.label).toBe("low");
+    });
+
+    it("an unusable planner answer is rechecked on Sonnet (2026-11-09: a Haiku planner refused outright)", async () => {
+      const { calls } = await runWorkflow([{ refused: "Not run yet." }, { stage: "red" }]);
+      expect(calls.find((c) => c.opts.label === "ralph:plan:1")!.opts.model).toBe("haiku");
+      expect(calls.find((c) => c.opts.label === "ralph:plan:1:recheck")!.opts.model).toBe("sonnet");
+    });
+
+    it("a failed preflight is rechecked once on Sonnet, and a healthy recheck carries the run on", async () => {
+      const { calls, result } = await runWorkflow([{ stage: "red" }], {
+        preflight: { ok: false, error: "I won't run that", warnings: "", adapter: null },
+        preflightRecheck: null,
+      });
+      expect(result.status).toBe("preflight-failed");
+      expect(calls.find((c) => c.opts.label === "ralph:preflight:recheck")!.opts.model).toBe("sonnet");
+      const ok = await runWorkflow([{ stage: "red" }], {
+        preflight: { ok: false, error: "I won't run that", warnings: "", adapter: null },
+        preflightRecheck: { ok: true, error: "", warnings: "", adapter: ADAPTER },
+      });
+      expect(ok.calls.some((c) => c.opts.label === "ralph:T1:red")).toBe(true);
+    });
+
+    it("a healthy preflight and gates run once each, with no recheck", async () => {
+      const { calls } = await runWorkflow([]);
+      expect(calls.filter((c) => /^ralph:(preflight|gates)/.test(c.opts.label ?? "")).map((c) => c.opts.label)).toEqual(["ralph:preflight", "ralph:gates"]);
+    });
+
+    it("a failed gates relay is rechecked once on Sonnet; a second failure is not fatal", async () => {
+      const bad = { ok: false, error: "refused", ticked: [], waiting: [], noCheck: [], prUrl: "" };
+      const { calls } = await runWorkflow([{ stage: "red" }], { gates: [bad, bad] });
+      expect(calls.find((c) => c.opts.label === "ralph:gates:recheck")!.opts.model).toBe("sonnet");
+      expect(calls.some((c) => c.opts.label === "ralph:T1:red")).toBe(true);
     });
 
     it("the planner is told to always run the commands itself", async () => {
@@ -464,7 +505,7 @@ describe("ralph-loop workflow plumbing (2026-10-12 lessons)", () => {
       for (const adapter of [null, { ...ADAPTER, commands: { typecheck: "x", testFiles: "y" } }]) {
         const { calls, result } = await runWorkflow([{ stage: "red" }], { preflight: { ok: true, error: "", warnings: "", adapter } });
         expect(result.status).toBe("preflight-failed");
-        expect(calls.map((c) => c.opts.label)).toEqual(["ralph:preflight"]);
+        expect(calls.map((c) => c.opts.label)).toEqual(["ralph:preflight", "ralph:preflight:recheck"]);
       }
       const { result } = await runWorkflow([{ stage: "red" }], { preflight: { ok: true, error: "", warnings: "", adapter: { ...ADAPTER, commands: { typecheck: "x", testFiles: "y" } } } });
       expect(result.message).toMatch(/commands\.mergeGate/);
@@ -483,10 +524,10 @@ describe("ralph-loop workflow plumbing (2026-10-12 lessons)", () => {
   describe("2026-11-02: scripted merge + small tasks", () => {
     const merged = { ok: true, error: "", status: "merged", sha: "abc", message: "PR #5 squash-merged at abc" };
 
-    it("the merge stage first runs merge.ts through a Sonnet relay in a worktree, after the adapter's setup", async () => {
+    it("the merge stage first runs merge.ts through a Haiku relay in a worktree, after the adapter's setup", async () => {
       const { calls } = await runWorkflow([{ stage: "merge" }], { scriptedMerge: merged });
       const relay = calls.find((c) => c.opts.label === "ralph:T1:merge:script")!;
-      expect(relay.opts).toMatchObject({ model: "sonnet", isolation: "worktree", agentType: "general-purpose" });
+      expect(relay.opts).toMatchObject({ model: "haiku", isolation: "worktree", agentType: "general-purpose" });
       expect(relay.prompt).toContain(`node "${ROOT}/lib/merge.ts" --pr 0 --branch "ralph/f/T1" --ledger "docs/ralph/f-LEDGER.json" --task "T1"`);
       expect(relay.prompt).toContain("`pnpm install --frozen-lockfile --prefer-offline`");
       expect(relay.prompt).toMatch(/600000/);
@@ -548,7 +589,8 @@ describe("ralph-loop workflow plumbing (2026-10-12 lessons)", () => {
       const { calls } = await runWorkflow([{ stage: "implement", size: "small" }, { stage: "review", size: "small" }]);
       const impl = calls.find((c) => c.opts.label === "ralph:T1:implement")!.prompt;
       const review = calls.find((c) => c.opts.label === "ralph:T1:review")!.prompt;
-      expect(impl).toMatch(/SMALL code task/);
+      expect(impl).toMatch(/LIGHT \(small\) code task/);
+      expect(review).toMatch(/still fits the light lane/);
       expect(impl).toMatch(/write the acceptance tests yourself/);
       expect(impl).toContain("size=small");
       expect(review).toMatch(/NO red and NO check stage/);
