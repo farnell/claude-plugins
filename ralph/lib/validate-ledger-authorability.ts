@@ -458,7 +458,7 @@ export function validateLedgerAuthorability(
 // non-empty `unbatched` reason.
 //
 // The same shape with two STANDARD tasks is a warning, not an error (1.2.0,
-// "batch by default"): reviews are LLM-run, so a 2–3 section PR is fine, but a
+// "batch by default"): reviews are LLM-run, so a PR of up to ~5 sections is fine, but a
 // pair of standard tasks can have a real reason to stay apart (a migration the
 // addendum keeps on its own, a combined slice over the span cap) that the
 // ledger can't see.
@@ -542,7 +542,11 @@ function batchingFindings(tasks: AuthorabilityTaskLike[]): { errors: string[]; w
 
 // A slice bigger than this many lines probably bundles more than one unit of
 // work. Conservative on purpose — this is a warning, not a block.
-const MEGA_TASK_LINE_SPAN = 150;
+// 1.4.0 (2026-11-23): raised from 150 to 300. Matt was asking every /ralph
+// session to "batch aggressively" by hand; at 150 a typical batch of three
+// sections hit the cap and stayed split, so each extra PR paid ~3–5 more fresh
+// agents of ~40k fixed context. Reviews are LLM-run and handle a 300-line slice.
+const MEGA_TASK_LINE_SPAN = 300;
 
 // ---------------------------------------------------------------------------
 // Lanes (1.3.0). A light task is cheap (2 stages), but each one is still a PR

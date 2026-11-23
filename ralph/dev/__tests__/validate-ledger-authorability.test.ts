@@ -211,7 +211,7 @@ describe("validateLedgerAuthorability", () => {
       ledger([
         task({
           id: "T1",
-          pointer: "docs/x.md §9 W4 — lines 100,400",
+          pointer: "docs/x.md §9 W4 — lines 100,500",
           verify: "gate",
         }),
       ]),
@@ -714,9 +714,9 @@ describe("pointerLineSpan — multi-section pointers", () => {
 
   it("warns on a multi-section task whose ranges together are a mega-task, but not on one that is small together", () => {
     const big = validateLedgerAuthorability(
-      ledger([task({ id: "T1", pointer: "docs/x.md §S12 — lines 10,100; §S13 — lines 200,290" })]),
+      ledger([task({ id: "T1", pointer: "docs/x.md §S12 — lines 10,200; §S13 — lines 300,490" })]),
     );
-    expect(big.warnings.some((w) => w.includes("spans ~180 lines"))).toBe(true);
+    expect(big.warnings.some((w) => w.includes("spans ~380 lines"))).toBe(true);
     // The old first-range-only parse would also pass this; the far-apart second
     // section must not be read as one giant 10→400 range.
     const small = validateLedgerAuthorability(
@@ -726,19 +726,19 @@ describe("pointerLineSpan — multi-section pointers", () => {
   });
 });
 
-describe("span cap — a sensible 2–3 section batch does not warn", () => {
+describe("span cap — a sensible batch of up to ~5 sections does not warn", () => {
   const spans = (pointer: string) =>
     validateLedgerAuthorability(ledger([task({ id: "T1", pointer })])).warnings.filter((w) => w.includes("spans ~"));
 
-  it("three sections summing to 150 lines: no warning", () => {
-    expect(spans("docs/x.md §S1 — lines 10,60; §S2 — lines 100,150; §S3 — lines 200,250")).toEqual([]);
+  it("three sections summing to 300 lines: no warning", () => {
+    expect(spans("docs/x.md §S1 — lines 10,110; §S2 — lines 200,300; §S3 — lines 400,500")).toEqual([]);
   });
 
-  it("over 150 summed lines: warns, naming the cap", () => {
-    const w = spans("docs/x.md §S1 — lines 10,61; §S2 — lines 100,150; §S3 — lines 200,250");
+  it("over 300 summed lines: warns, naming the cap", () => {
+    const w = spans("docs/x.md §S1 — lines 10,111; §S2 — lines 200,300; §S3 — lines 400,500");
     expect(w).toHaveLength(1);
-    expect(w[0]).toMatch(/spans ~151 lines/);
-    expect(w[0]).toMatch(/~150-line cap/);
+    expect(w[0]).toMatch(/spans ~301 lines/);
+    expect(w[0]).toMatch(/~300-line cap/);
   });
 
   it("a done or batched row never gets the span warning", () => {
@@ -824,8 +824,8 @@ describe("lanes (1.3.0)", () => {
       expect(w[0]).toMatch(/A \+ B \+ C \(~57 lines\)/);
     });
 
-    it("respects the ~150-line cap", () => {
-      const big = (id: string) => lt(id, { pointer: `docs/x.md §${id} — lines 1,100` });
+    it("respects the ~300-line cap", () => {
+      const big = (id: string) => lt(id, { pointer: `docs/x.md §${id} — lines 1,200` });
       expect(sweep(validateLedgerAuthorability(v3([big("A"), big("B")])))).toEqual([]);
     });
 
