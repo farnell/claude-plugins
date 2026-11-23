@@ -105,7 +105,7 @@ async function runWorkflow(plans: PlanScript[], o: RunOpts = {}) {
         next: { ...EMPTY_NEXT, taskId: "T1", title: "t", pointer: "p", kind: p.kind ?? "code", size: p.size ?? "standard", verify: "gate", stage: p.stage, lastEvent: p.lastEvent ?? "none", branch: "ralph/f/T1", markerCount: planIdx, redSha: p.redSha ?? "", prevRedSha: p.prevRedSha ?? "", redFiles: p.redFiles ?? [] },
       };
     }
-    if (label === "ralph:cleanup" || label.endsWith(":script-cleanup")) return { output: cleanupLine };
+    if (label.startsWith("ralph:cleanup") || label.endsWith(":script-cleanup")) return { output: cleanupLine };
     if (label.endsWith(":merge:script")) {
       return {
         ok: false, error: "exit 1", status: "", sha: "", migrationAdded: "", typecheckFailed: false, ciFailed: false, failedFiles: [], guardReasons: [], message: "", detail: "",
@@ -713,11 +713,67 @@ describe("no planner between steps: the finishing stage carries the next step (1
     expect(planners(calls)).toHaveLength(1);
   });
 
-  it("a stage that finished without moving the task still trips the stall guard", async () => {
-    const { result } = await runWorkflow([{ stage: "red" }], {
-      // Every red run "finishes" but its lookup still points at red, same marker count.
-      stageResult: (label) => (label === "ralph:T1:red" ? { plan: carriedPlan("red", 1) } : undefined),
+  it("a lookup made before the marker (no progress on the same task) is not trusted: the planner decides", async () => {
+    // red ran at markerCount 1; its carried plan still says markerCount 1 → the planner is asked, nothing reruns on it.
+    const { calls } = await runWorkflow([{ stage: "red" }, { stage: "implement" }], {
+      stageResult: (label) => (label === "ralph:T1:red" ? { plan: carriedPlan("implement", 1) } : undefined),
     });
-    expect(result.history).toContainEqual(expect.objectContaining({ task: "T1", outcome: "stalled" }));
+    expect(planners(calls).map((c) => c.opts.label)).toEqual(["ralph:plan:1", "ralph:plan:2", "ralph:plan:3"]);
+    expect(labels(calls).filter((l) => l === "ralph:T1:red")).toHaveLength(1);
+  });
+
+  it("a carried plan naming a stage that cannot follow (check → merge skips review) goes to the planner", async () => {
+    const { calls } = await runWorkflow([{ stage: "check" }, { stage: "review" }], {
+      stageResult: (label) => (label === "ralph:T1:check" ? { plan: carriedPlan("merge", 9) } : undefined),
+    });
+    expect(labels(calls)).not.toContain("ralph:T1:merge:script");
+    expect(labels(calls)).toContain("ralph:T1:review");
+    expect(planners(calls).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("a carried plan for a different task is taken as is (next-step chose it)", async () => {
+    const { calls } = await runWorkflow([{ stage: "red" }], {
+      stageResult: (label) => (label === "ralph:T1:red" ? { plan: { ...carriedPlan("red", 0), next: { ...carriedPlan("red", 0).next, taskId: "T2", branch: "ralph/f/T2", prNumber: 0 } } } : label === "ralph:T2:red" ? { plan: PARKED_PLAN } : undefined),
+    });
+    expect(labels(calls)).toContain("ralph:T2:red");
+  });
+
+  it("a worktree whose removal the next agent skipped is retried at the report, not dropped as kept", async () => {
+    const { calls, result } = await runWorkflow([{ stage: "red" }], {
+      stageResult: (label) =>
+        label === "ralph:T1:red" ? { plan: carriedPlan("implement", 2) }
+        : label === "ralph:T1:implement" ? { plan: PARKED_PLAN, cleanup: "" } // skipped the housekeeping
+        : undefined,
+    });
+    const red = calls.findIndex((c) => c.opts.label === "ralph:T1:red");
+    const cleanups = calls.filter((c) => c.opts.label?.startsWith("ralph:cleanup"));
+    expect(cleanups).toHaveLength(2);
+    expect(cleanups[0]!.prompt).toContain(`remove "/repo/.claude/worktrees/wf_x-${red + 1}"`);
+    expect(result.keptWorktrees).toEqual([]);
+  });
+
+  it("scripted relay removes the previous worktree; when it hands back, the merge agent is not asked to remove it again", async () => {
+    const { calls, result } = await runWorkflow([{ stage: "review" }], {
+      scriptedMerge: { ok: true, error: "", status: "conflict", message: "conflict in a.ts" },
+      stageResult: (label) =>
+        label === "ralph:T1:review" ? { plan: carriedPlan("merge", 2) }
+        : label === "ralph:T1:merge" ? { plan: PARKED_PLAN }
+        : undefined,
+    });
+    const review = calls.findIndex((c) => c.opts.label === "ralph:T1:review");
+    const reviewTree = `/repo/.claude/worktrees/wf_x-${review + 1}`;
+    expect(calls.find((c) => c.opts.label === "ralph:T1:merge:script")!.prompt).toContain(`remove "${reviewTree}"`);
+    expect(calls.find((c) => c.opts.label === "ralph:T1:merge")!.prompt).not.toMatch(/worktrees\.ts" remove/);
+    expect(calls.filter((c) => c.prompt.includes(`remove "${reviewTree}"`))).toHaveLength(1);
+    expect(result.keptWorktrees).toEqual([]);
+  });
+
+  it("a migration stop after a carried merge plan: the plan is unused and the report removes the last worktree", async () => {
+    const { calls, result } = await runWorkflow([{ stage: "merge" }], {
+      scriptedMerge: { ok: true, error: "", status: "merged", sha: "abc", migrationAdded: "drizzle/0210_x.sql", afterMigration: "stop", message: "PR #5 squash-merged" },
+      stageResult: (label) => (label === "ralph:T1:merge:script" ? { plan: DONE_PLAN } : undefined),
+    });
+    expect(result.status).toBe("migration-pending");
+    expect(calls.find((c) => c.opts.label === "ralph:cleanup")?.prompt).toMatch(/wf_script-/);
   });
 });

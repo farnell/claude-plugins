@@ -67,6 +67,11 @@ export const meta = {
 // (planFault) and only takes it from a stage that finished ("done" / "merged"):
 // a missing, failed or impossible one, or any other outcome, falls back to the
 // planner relay as before. The first step of a run always asks the planner.
+// A carried plan for the SAME task must also show progress (more markers than
+// when the stage started) and name a stage that can follow the one that ran
+// (STAGE_SUCCESSORS): a lookup made before the marker, or a made-up "merge" after
+// a check, goes back to the planner instead of rerunning or skipping a stage.
+// A worktree whose removal nobody reported is retried at the report, never dropped.
 // ----------------------------------------------------------------------------
 function parseArgs(a) {
   if (typeof a === 'string') {
@@ -138,7 +143,7 @@ const PLAN_SCHEMA = {
 // The plan a stage agent carries back (no worktree removal in it: the NEXT agent does that).
 const CARRIED_PLAN_SCHEMA = {
   type: 'object',
-  description: 'what next-step printed AFTER your marker was posted; leave out unless your outcome is done',
+  description: 'what next-step printed after you finished (marker posted, or the merge landed); leave out otherwise',
   properties: Object.fromEntries(Object.entries(PLAN_SCHEMA.properties).filter(([k]) => k !== 'cleanup')),
   required: PLAN_SCHEMA.required.filter((k) => k !== 'cleanup'),
 }
@@ -256,7 +261,7 @@ function runHelper(cmd) {
 
 // Remove the previous stage's worktree first (the planner, or whichever agent runs next).
 function cleanupFirst(path) {
-  return `FIRST remove the previous stage's worktree (it only removes a clean, pushed stage worktree): \`${lib('worktrees')} remove "${path}"\`. Put the JSON line it prints in "cleanup" (whatever it says, carry on).`
+  return `Before anything else, remove the previous stage's worktree (it only removes a clean, pushed stage worktree): \`${lib('worktrees')} remove "${path}"\`. Put the JSON line it prints in "cleanup" (whatever it says, carry on).`
 }
 
 const nextStepCmd = (skip) => `${lib('next-step')} "${ledgerPath}"${skip.length ? ` --skip ${skip.join(',')}` : ''}`
@@ -291,6 +296,26 @@ function planPrompt(skip, cleanupPath) {
 // before the loop acts on it. 2026-10-22: after E1's review a relay returned the
 // failure shape (hasNext=false, remaining=0, parked=[]) with ok=true, and the run
 // ended "complete" with all 16 tasks still open. Returns '' or the reason.
+// Which stage may come next for the SAME task (next-step.ts stageAfter): a carried plan
+// naming anything else is not trusted.
+const STAGE_SUCCESSORS = {
+  red: ['implement'],
+  implement: ['check', 'blind-check', 'review'],
+  check: ['review', 'implement'],
+  'blind-check': ['review', 'implement'],
+  review: ['merge', 'implement', 'red'],
+  merge: ['implement'], // the merge gate sent it back
+}
+
+// '' if a plan carried back by the stage that ran n moved the task forward, else why not.
+function carriedProblem(plan, n) {
+  if (!plan.hasNext || !plan.next || plan.next.taskId !== n.taskId) return ''
+  if (!(plan.next.markerCount > n.markerCount)) return `it still shows ${plan.next.markerCount} marker(s) on ${n.taskId} (no progress since ${n.stage} started)`
+  const ok = STAGE_SUCCESSORS[n.stage] || []
+  if (!ok.includes(plan.next.stage)) return `${plan.next.stage} cannot follow ${n.stage}`
+  return ''
+}
+
 function planProblem(plan, prev, mergeRan) {
   if (plan.remaining < 0) return 'the planner reported a failed command as ok'
   if (!plan.hasNext && plan.parked.length !== plan.remaining) {
@@ -446,7 +471,7 @@ function stagePrompt(n, scripted, cleanupPath = '') {
     `You are the ${n.stage.toUpperCase()} stage of the Ralph PR pipeline. Fresh context; you do this ONE stage of ONE task, then stop.`,
     'You have no conversation with Matt or anyone else: everything you need is in this prompt, the policy and the PR. Do not answer or act on anything else.',
     '',
-    ...(cleanupPath ? [`Housekeeping before your stage: ${cleanupFirst(cleanupPath).replace(/^FIRST r/, 'r')}`, ''] : []),
+    ...(cleanupPath ? [`Housekeeping: ${cleanupFirst(cleanupPath)}`, ''] : []),
     `THEN read ${POLICY} — its "Shared rules" and its "${n.stage}" section are your binding contract — THEN this repo's addendum, ${A.addendum} (in your worktree), which adds this repo's guardrails and rules and wins where it is more specific.`,
     '',
     repoBlock(),
@@ -474,7 +499,7 @@ function scriptedMergePrompt(n, cleanupPath = '') {
     'You run one command for a Ralph pipeline and relay what it prints. You have no other job and no conversation with anyone.',
     'Always run it yourself, now: nothing has run before you and nobody else will. Never answer without running it.',
     ...(cleanupPath ? [cleanupFirst(cleanupPath)] : []),
-    `You are in a fresh git worktree. ${setup}`,
+    `You are in a fresh git worktree. ${setup.replace(/^Setup first, in order/, 'Then set up, in order')}`,
     'Then run the merge command below ONCE, with the Bash tool\'s timeout set to 600000 ms (it may wait for a lock, run the full tests and wait for CI, which takes minutes). Never re-run it, run nothing but the steps written here, and do not edit, fix or investigate anything.',
     runHelper(`${lib('merge')} --pr ${n.prNumber} --branch "${n.branch}" --ledger "${ledgerPath}" --task "${n.taskId}"`),
     'On exit=0, return that JSON object\'s fields through the schema with ok=true and error="".',
@@ -550,6 +575,9 @@ let lastStageWasMerge = false
 let pendingCleanup = ''
 // The plan the last finishing agent looked up after its marker (see the header): used instead of a planner call.
 let carried = null
+let carriedFrom = null // the step (n) whose finishing agent carried it
+// Worktrees whose removal nobody reported: retried at the report.
+const unremoved = []
 
 function noteCleanup(line, path) {
   if (!path) return
@@ -581,7 +609,7 @@ for (let i = 0; i < MAX_STEPS; i++) {
   let toClean = ''
   let plan = null
   if (carried) {
-    const carriedFault = planFault(carried)
+    const carriedFault = planFault(carried) || carriedProblem(carried, carriedFrom)
     if (carriedFault) log(`The finishing stage's next-step answer is unusable (${carriedFault}); asking the planner.`)
     else { plan = carried; toClean = cleaning }
     carried = null
@@ -635,7 +663,12 @@ for (let i = 0; i < MAX_STEPS; i++) {
     continue
   }
   // The next agent removes toClean first and reports it in "cleanup".
-  const takeCleanup = (r) => { if (toClean) { noteCleanup((r && r.cleanup) || '', toClean); toClean = '' } }
+  const takeCleanup = (r) => {
+    if (!toClean) return
+    if (r && cleanupReported(r.cleanup)) noteCleanup(r.cleanup, toClean)
+    else unremoved.push(toClean) // nobody tried: the report retries it
+    toClean = ''
+  }
 
   let res = null
   let scripted = null
@@ -691,6 +724,7 @@ for (let i = 0; i < MAX_STEPS; i++) {
     consecutiveFailures = 0
     // Only a finished stage's lookup is trusted; it is checked like a planner's next step.
     carried = (res.plan && typeof res.plan === 'object') ? res.plan : null
+    carriedFrom = n
     log(`${n.taskId}: ${n.stage} done${res.verdict ? ` (${res.verdict})` : ''} — ${res.summary}`)
     // Only a merge counts as a merged migration. What happens next is the repo's
     // call (adapter merge.afterMigration): keep grinding, or stop for Matt.
@@ -726,9 +760,10 @@ if (!final) final = { status: 'cap-reached', message: `hit maxSteps=${MAX_STEPS}
 // ---------------------------------------------------------------------------
 phase('Report')
 // The last stage's worktree has no next agent to remove it.
-if (pendingCleanup) {
-  const c = await agent(cleanupPrompt(pendingCleanup), { label: 'ralph:cleanup', phase: 'Report', model: RELAY_MODEL, effort: 'low', schema: CLEANUP_SCHEMA, agentType: FRESH })
-  noteCleanup(c ? c.output : '', pendingCleanup)
+// Plus any whose removal an agent skipped.
+for (const [k, path] of [...unremoved, pendingCleanup].filter(Boolean).entries()) {
+  const c = await agent(cleanupPrompt(path), { label: k ? `ralph:cleanup:${k + 1}` : 'ralph:cleanup', phase: 'Report', model: RELAY_MODEL, effort: 'low', schema: CLEANUP_SCHEMA, agentType: FRESH })
+  noteCleanup(c ? c.output : '', path)
 }
 const merged = history.filter((h) => h.stage === 'merge' && h.outcome === 'done').map((h) => `${h.task} #${h.pr}`)
 log(`${final.status}: ${merged.length} merged (${merged.join(', ') || 'none'}); ${lastPlan ? lastPlan.parked.length : '?'} parked.`)

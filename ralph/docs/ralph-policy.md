@@ -45,7 +45,7 @@ install): it loads and validates the repo's adapter (`.claude/ralph.json`), remo
 worktrees, then stops with a plain message if free disk is under the repo's floor (adapter
 `minFreeGb`, default 25 GB; `RALPH_MIN_FREE_GB` overrides) or if the repo's install probe does
 not run non-interactively (for example pnpm wants to reinstall `node_modules` and has no terminal
-to ask). **After each stage** the loop removes that stage's worktree (RALPH `worktrees remove
+to ask). **After each stage** the next agent (or the report) removes that stage's worktree (RALPH `worktrees remove
 <path>`) if it is clean and
 pushed; one that is not is kept and listed in the run result's `keptWorktrees`. Removal deletes
 every git-ignored file too, so a worktree holding any ignored file other than `node_modules`, the
@@ -129,8 +129,8 @@ message (skill Step 5). Pinned by the plugin's `dev/__tests__/ralph-loop-workflo
    worktrees share refs, so a local branch left checked out in a dead worktree blocks every later
    stage (`already checked out`).
 4. End with a clean tree (`git status --porcelain` empty), everything pushed, and report your
-   worktree's path (`git rev-parse --show-toplevel`) as `worktreePath`. **The loop deletes your
-   worktree after you finish**: anything not pushed or posted on the PR is gone. A dirty or
+   worktree's path (`git rev-parse --show-toplevel`) as `worktreePath`. **The next agent deletes
+   your worktree after you finish**: anything not pushed or posted on the PR is gone. A dirty or
    unpushed worktree is kept instead and listed for Matt, which is a leak, not a save.
 
 ### Git
