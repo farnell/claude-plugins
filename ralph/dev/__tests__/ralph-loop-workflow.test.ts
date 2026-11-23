@@ -59,7 +59,21 @@ interface RunOpts {
   /** The gates relay's answers, first then recheck (default: healthy). */
   gates?: (Record<string, unknown> | null)[];
   args?: Record<string, unknown>;
+  /** Extra fields for a stage or scripted-merge answer, by label (e.g. a carried "plan"). */
+  stageResult?: (label: string, prompt: string) => Record<string, unknown> | undefined;
 }
+
+/** A healthy next-step answer, as a finishing stage carries it back (1.5.0). */
+function carriedPlan(stage: string, markerCount: number, extra: Record<string, unknown> = {}) {
+  return {
+    ok: true, error: "", hasNext: true, parked: [], remaining: 1, batched: 0,
+    next: { ...EMPTY_NEXT, taskId: "T1", title: "t", pointer: "p", kind: "code", size: "standard", verify: "gate", stage, branch: "ralph/f/T1", prNumber: 5, markerCount },
+    ...extra,
+  };
+}
+const DONE_PLAN = { ok: true, error: "", hasNext: false, parked: [], remaining: 0, batched: 0, next: EMPTY_NEXT };
+// Nothing runnable, the one open task parked: what a non-merge stage can honestly carry at the end.
+const PARKED_PLAN = { ok: true, error: "", hasNext: false, parked: [{ id: "T1", reason: "awaiting-human" }], remaining: 1, batched: 0, next: EMPTY_NEXT };
 
 /** Run the workflow body with scripted planner answers; stages always succeed. */
 async function runWorkflow(plans: PlanScript[], o: RunOpts = {}) {
@@ -96,10 +110,17 @@ async function runWorkflow(plans: PlanScript[], o: RunOpts = {}) {
       return {
         ok: false, error: "exit 1", status: "", sha: "", migrationAdded: "", typecheckFailed: false, ciFailed: false, failedFiles: [], guardReasons: [], message: "", detail: "",
         worktreePath: `/repo/.claude/worktrees/wf_script-${calls.length}`,
+        cleanup: /worktrees\.ts" remove/.test(prompt) ? cleanupLine : "",
         ...(o.scriptedMerge ?? {}),
+        ...(o.stageResult?.(label, prompt) ?? {}),
       };
     }
-    return { outcome: "done", prNumber: 5, summary: "ok", worktreePath: `/repo/.claude/worktrees/wf_x-${calls.length}`, ...(o.stageExtra ?? {}) };
+    return {
+      outcome: "done", prNumber: 5, summary: "ok", worktreePath: `/repo/.claude/worktrees/wf_x-${calls.length}`,
+      cleanup: /worktrees\.ts" remove/.test(prompt) ? cleanupLine : "",
+      ...(o.stageExtra ?? {}),
+      ...(o.stageResult?.(label, prompt) ?? {}),
+    };
   };
   const args = o.args ?? { ralphRoot: ROOT, ledgerPath: "docs/ralph/f-LEDGER.json" };
   const result = (await fn(args, agent, () => {}, () => {})) as Record<string, unknown>;
@@ -601,5 +622,102 @@ describe("ralph-loop workflow plumbing (2026-10-12 lessons)", () => {
       const { calls } = await runWorkflow([{ stage: "review" }]);
       expect(calls.find((c) => c.opts.label === "ralph:T1:review")!.prompt).toMatch(/redo-red/);
     });
+  });
+});
+
+describe("no planner between steps: the finishing stage carries the next step (1.5.0)", () => {
+  const labels = (calls: Call[]) => calls.map((c) => c.opts.label);
+  const planners = (calls: Call[]) => calls.filter((c) => c.opts.label?.startsWith("ralph:plan:"));
+
+  it("a full code task runs one planner call, at the start; every later step comes from the stage that finished", async () => {
+    const next: Record<string, unknown> = {
+      "ralph:T1:red": carriedPlan("implement", 2),
+      "ralph:T1:implement": carriedPlan("check", 3),
+      "ralph:T1:check": carriedPlan("review", 4),
+      "ralph:T1:review": carriedPlan("merge", 5),
+      "ralph:T1:merge:script": DONE_PLAN,
+    };
+    const { calls, result } = await runWorkflow([{ stage: "red" }], {
+      scriptedMerge: { ok: true, error: "", status: "merged", sha: "abc", migrationAdded: "", afterMigration: "continue", message: "PR #5 squash-merged" },
+      stageResult: (label) => (next[label] ? { plan: next[label] } : undefined),
+    });
+    expect(result.status).toBe("complete");
+    expect(planners(calls)).toHaveLength(1);
+    expect(labels(calls).filter((l) => l?.startsWith("ralph:T1:"))).toEqual([
+      "ralph:T1:red", "ralph:T1:implement", "ralph:T1:check", "ralph:T1:review", "ralph:T1:merge:script",
+    ]);
+    expect(result.merged).toEqual(["T1 #5"]);
+  });
+
+  it("each agent removes the previous stage's worktree first; the report removes the last; nothing is kept", async () => {
+    const { calls, result } = await runWorkflow([{ stage: "red" }], {
+      stageResult: (label) => (label === "ralph:T1:red" ? { plan: carriedPlan("implement", 2) } : label === "ralph:T1:implement" ? { plan: PARKED_PLAN } : undefined),
+    });
+    const red = calls.findIndex((c) => c.opts.label === "ralph:T1:red");
+    const impl = calls.find((c) => c.opts.label === "ralph:T1:implement")!;
+    expect(calls[red]!.prompt).not.toMatch(/worktrees\.ts" remove/);
+    expect(impl.prompt).toContain(`node "${ROOT}/lib/worktrees.ts" remove "/repo/.claude/worktrees/wf_x-${red + 1}"`);
+    // The stage still reads the policy, after the housekeeping.
+    expect(impl.prompt.indexOf("worktrees.ts")).toBeLessThan(impl.prompt.indexOf("ralph-policy.md"));
+    expect(calls.find((c) => c.opts.label === "ralph:cleanup")?.prompt).toMatch(/remove "\/repo\/\.claude\/worktrees\/wf_x-/);
+    expect(planners(calls)).toHaveLength(1);
+    expect(result.keptWorktrees).toEqual([]);
+  });
+
+  it("every stage and the scripted merge are told to look up the next step after their marker, with the run's skip list", async () => {
+    const { calls } = await runWorkflow([{ stage: "red" }, { stage: "merge" }], {
+      scriptedMerge: { ok: true, error: "", status: "busy", message: "lock held" },
+    });
+    const red = calls.find((c) => c.opts.label === "ralph:T1:red")!;
+    expect(red.prompt).toContain(`node "${ROOT}/lib/next-step.ts" "docs/ralph/f-LEDGER.json"`);
+    expect(red.prompt).toMatch(/only if your outcome is done/);
+    expect(red.prompt).toMatch(/never act on it/);
+    const script = calls.find((c) => c.opts.label === "ralph:T1:merge:script")!;
+    expect(script.prompt).toMatch(/only if the merge command printed status "merged"/);
+    expect(script.prompt.indexOf("merge.ts")).toBeLessThan(script.prompt.indexOf("next-step.ts"));
+    // Busy parks T1; the planner that follows passes --skip T1.
+    expect(planners(calls).at(-1)!.prompt).toMatch(/next-step\.ts" "docs\/ralph\/f-LEDGER\.json" --skip T1/);
+  });
+
+  it("a carried plan whose lookup failed falls back to the planner, which also removes the worktree", async () => {
+    const { calls } = await runWorkflow([{ stage: "red" }, { stage: "implement" }], {
+      stageResult: (label) => (label === "ralph:T1:red" ? { plan: { ...carriedPlan("implement", 2), ok: false, error: "exit 1", remaining: -1, hasNext: false } } : undefined),
+    });
+    expect(planners(calls).map((c) => c.opts.label)).toEqual(["ralph:plan:1", "ralph:plan:2", "ralph:plan:3"]);
+    expect(planners(calls)[1]!.prompt).toMatch(/worktrees\.ts" remove "\/repo\/\.claude\/worktrees\/wf_x-/);
+    expect(calls.find((c) => c.opts.label === "ralph:T1:implement")!.prompt).not.toMatch(/worktrees\.ts" remove/);
+  });
+
+  it("an impossible carried plan (open tasks dropped with no merge) is not trusted", async () => {
+    const { calls } = await runWorkflow([{ stage: "red", remaining: 5 }, { stage: "implement", remaining: 5 }], {
+      stageResult: (label) => (label === "ralph:T1:red" ? { plan: carriedPlan("implement", 2, { remaining: 2 }) } : undefined),
+    });
+    expect(planners(calls).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("a plan from a stage that did not finish is ignored: blocked or failed goes back to the planner", async () => {
+    for (const outcome of ["blocked", "failed"]) {
+      const { calls } = await runWorkflow([{ stage: "red" }, { stage: "implement" }], {
+        stageResult: (label) => (label === "ralph:T1:red" ? { outcome, plan: carriedPlan("implement", 2) } : undefined),
+      });
+      expect(planners(calls).length).toBeGreaterThanOrEqual(2);
+    }
+  });
+
+  it("a scripted merge that did not merge never hands over its plan; the merge agent's own does", async () => {
+    const { calls } = await runWorkflow([{ stage: "merge" }], {
+      scriptedMerge: { ok: true, error: "", status: "conflict", message: "conflict in a.ts" },
+      stageResult: (label) => (label === "ralph:T1:merge:script" ? { plan: carriedPlan("review", 9) } : label === "ralph:T1:merge" ? { plan: DONE_PLAN } : undefined),
+    });
+    expect(labels(calls)).not.toContain("ralph:T1:review");
+    expect(planners(calls)).toHaveLength(1);
+  });
+
+  it("a stage that finished without moving the task still trips the stall guard", async () => {
+    const { result } = await runWorkflow([{ stage: "red" }], {
+      // Every red run "finishes" but its lookup still points at red, same marker count.
+      stageResult: (label) => (label === "ralph:T1:red" ? { plan: carriedPlan("red", 1) } : undefined),
+    });
+    expect(result.history).toContainEqual(expect.objectContaining({ task: "T1", outcome: "stalled" }));
   });
 });

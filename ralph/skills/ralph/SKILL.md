@@ -19,8 +19,10 @@ lane human (gate):  Matt does it; Ralph ticks it itself once its done_when evide
 
 (docs/measure review does the check duties itself; `blind-check` runs only for a measure task with
 `blind_check: true`.) Each stage is a fresh agent (no parent conversation) in its own worktree,
-removed when the stage ends; the `ralph-loop` Workflow (JavaScript) sequences
-them, so **this session's context does not grow with the grind**. The loop keeps no state: the
+removed by the next agent; the `ralph-loop` Workflow (JavaScript) sequences
+them, so **this session's context does not grow with the grind**. The agent that finishes a stage
+also looks up the next one (`next-step`), so no planner agent runs between stages (1.5.0); the
+loop falls back to a planner only when that answer is missing or wrong. The loop keeps no state: the
 ledger on `origin/main` plus marker comments on each task's PR are the whole state, and
 `next-step` reads them. **Resuming is just running `/ralph <doc>` again, in any session.**
 

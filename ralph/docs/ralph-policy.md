@@ -71,8 +71,14 @@ A failed `check` or a `review` asking for changes sends the task back to `implem
 where a task's own PR ticks it `done`, and (b) **marker comments** on the task's PR, one per
 finished stage. RALPH `next-step` reads both and names the next stage. A killed run, or a
 brand-new session, resumes exactly where the last one stopped. **So your stage is not finished
-until its marker comment is posted. Post the marker last, and only when the stage really
-succeeded.**
+until its marker comment is posted. Post the marker last on the PR, and only when the stage
+really succeeded.**
+
+**Housekeeping around your stage (1.5.0).** There is no planner agent between stages. Your prompt
+may first ask you to remove the previous stage's worktree (one helper command; report what it
+prints in `cleanup`). After your marker is posted, and only if your stage is done, you run RALPH
+`next-step` and return what it prints as `plan`. That only tells the loop what runs next: never act
+on it. The loop checks it like a planner's answer and asks the planner whenever it is missing or wrong.
 
 | Marker (an HTML comment in a PR comment) | Posted by | Means |
 |---|---|---|
