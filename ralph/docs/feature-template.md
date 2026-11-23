@@ -16,7 +16,7 @@
       money/auth/data/migrations/time zones/security, `light` (no red, no check
       stage) for UI, copy, wiring and removals; add `Lane: full|light` to override;
     • keep each section small; Ralph BATCHES related code sections (same area,
-      same files, a dep chain) into one PR of up to ~3 sections. Say "keep
+      same files, a dep chain) into one PR of up to ~5 sections. Say "keep
       separate: <reason>" on a section that must be its own PR (a migration
       usually is); name the files each code task edits;
     • deps stated in prose (they must form a DAG);

@@ -72,9 +72,9 @@ agent, one review, one PR, through the normal loop (never in the chat session).
 ### Batch by default
 
 Every task costs ~3–5 fresh agents, each starting with ~40k tokens of fixed context, and reviews
-are LLM-run, so a PR covering 2–3 related sections is fine. **A doc section is a unit of spec; a
+are LLM-run, so a PR covering up to ~5 related sections is fine. **A doc section is a unit of spec; a
 ledger task is a unit of PR.** At derivation, group related `code` sections into one task covering
-**up to ~3 sections**: the same feature area or panel, the same `files`, or a direct dep chain
+**up to ~5 sections**: the same feature area or panel, the same `files`, or a direct dep chain
 (e.g. a data loader + the help page that shows it; a panel rebuild + its chart; three cleanup /
 copy edits in one component). Every runnable code task lists the repo-relative paths it expects to
 edit in **`files`** (best effort, from its sections).
@@ -85,7 +85,7 @@ The stages read every listed section, and every section's acceptance applies. `f
 light, else `full`.
 
 **Light work is swept harder.** Light sections need not share files to share a PR: every light
-section that waits on the same open gates goes into as few tasks as the ~150-line cap allows (and
+section that waits on the same open gates goes into as few tasks as the ~300-line cap allows (and
 never two that have another open task between them in the dep graph). The validator warns with a
 suggested grouping when light tasks could ship as fewer PRs. A dep that only existed to serialize two members on a shared file goes away.
 
@@ -94,7 +94,7 @@ suggested grouping when light tasks could ship as fewer PRs. A dep that only exi
 - it is a human gate or decision, or the chain between the members crosses one (the gate has to
   happen between them);
 - the kinds differ (a `docs` or `measure` section doesn't join a `code` task);
-- the combined slice is over ~150 lines (the summed pointer ranges; the span warning says so);
+- the combined slice is over ~300 lines (the summed pointer ranges; the span warning says so);
 - there is a stated reason: `"unbatched": "<reason>"` on the task.
 
 **What the validator enforces** (both apply to runnable, not-done, not-gated `code` tasks that
@@ -327,8 +327,8 @@ preflight. Two tiers:
   depends on a task folded into it, or a host that doesn't wait on a folded task's deps.
 
 **Warnings (advisory, never block):**
-- a runnable task whose pointer slice spans over ~150 lines — a multi-section pointer counts the
-  sum of its ranges, so a sensible 2–3 section batch doesn't warn; split it or batch fewer;
+- a runnable task whose pointer slice spans over ~300 lines — a multi-section pointer counts the
+  sum of its ranges, so a sensible batch of up to ~5 sections doesn't warn; split it or batch fewer;
 - a runnable light (`small`) code task with no `files` (the batching check can't see it);
 - a light task whose wording looks like full-lane territory, or a lane with no `lane_reason`;
 - light tasks waiting on the same gates that could ship as fewer PRs within the span cap (with a

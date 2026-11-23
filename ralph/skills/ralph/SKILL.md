@@ -126,16 +126,16 @@ every listed section's acceptance applies.
   either make it full or keep it light because the change really is only markup.
 - **Batch by default.** A doc section is a unit of spec; a ledger task is a unit of PR, and reviews
   are LLM-run, so big PRs are fine. Group related code sections (same feature area or panel, same
-  `files`, or a direct dep chain) into one task covering **up to ~3 sections**, with the
+  `files`, or a direct dep chain) into one task covering **up to ~5 sections**, with the
   multi-section title and pointer from Step 1, `files` = the union, `deps` = the union minus the
   members (drop deps that only serialized them). It is `light` only if every member would be.
   **Sweep light work harder:** light sections need not touch the same files to share a PR; put
-  every light section that waits on the same gates into as few tasks as the ~150-line cap
+  every light section that waits on the same gates into as few tasks as the ~300-line cap
   allows. The validator warns with a suggested grouping when it sees light tasks that could ship
   as fewer PRs; act on it.
   Keep a task on its own only when: it carries a migration (or the addendum says never-batch), it
   is a gate/decision or the chain between members crosses one, the kinds differ, the combined
-  slice is over ~150 summed lines, or it has a stated `"unbatched": "<reason>"`. The validator
+  slice is over ~300 summed lines, or it has a stated `"unbatched": "<reason>"`. The validator
   **errors** on a same-file dep-linked pair where either is light (small), and **warns** on a
   full pair; a non-empty `unbatched` silences both. Fill `files` on every runnable code task; a
   light one without `files` warns. See the authoring guide §Batch by default.
